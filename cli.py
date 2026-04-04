@@ -3999,6 +3999,8 @@ class HermesCLI:
             self._show_usage()
         elif canonical == "insights":
             self._show_insights(cmd_original)
+        elif canonical == "logs":
+            self._handle_logs_command(cmd_original)
         elif canonical == "paste":
             self._handle_paste_command()
         elif canonical == "reload-mcp":
@@ -4936,6 +4938,63 @@ class HermesCLI:
             db.close()
         except Exception as e:
             print(f"  Error generating insights: {e}")
+
+    def _handle_logs_command(self, command: str = "/logs"):
+        """Show Hermes logs with filtering."""
+        import argparse, sys
+        from pathlib import Path
+
+        HERMES_HOME = Path.home() / ".hermes"
+        sys.path.insert(0, str(HERMES_HOME))
+
+        parts = command.split()
+        all_logs = "--all" in parts or "--gateway" in parts
+        errors_only = "--errors" in parts
+        autonomy = "--autonomy" in parts
+        no_limit_flag = "--no-limit" in parts
+
+        filter_text = None
+        level = None
+        since = None
+        limit = 50
+
+        for i, part in enumerate(parts):
+            if part == "--filter" and i + 1 < len(parts):
+                filter_text = parts[i + 1]
+            elif part == "--level" and i + 1 < len(parts):
+                level = parts[i + 1].upper()
+            elif part == "--since" and i + 1 < len(parts):
+                try:
+                    since = int(parts[i + 1])
+                except ValueError:
+                    print(f"  Invalid --since value: {parts[i + 1]}")
+                    return
+            elif part == "--limit" and i + 1 < len(parts):
+                try:
+                    limit = int(parts[i + 1])
+                except ValueError:
+                    limit = 50
+
+        try:
+            sys.path.insert(0, str(Path.home() / ".hermes"))
+            from autonomy.log_viewer import cmd_list
+            import argparse as _argparse
+
+            args = _argparse.Namespace(
+                all=all_logs,
+                errors=errors_only,
+                autonomy=autonomy,
+                filter=filter_text,
+                level=level,
+                since=since,
+                limit=limit,
+            )
+            result = cmd_list(args)
+            print(result)
+        except Exception as e:
+            import traceback
+            print(f"  Error reading logs: {e}")
+            traceback.print_exc()
 
     def _check_config_mcp_changes(self) -> None:
         """Detect mcp_servers changes in config.yaml and auto-reload MCP connections.

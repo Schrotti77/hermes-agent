@@ -1836,7 +1836,7 @@ class GatewayRunner:
                             adapter._pending_messages[_quick_key] = event
                     else:
                         adapter._pending_messages[_quick_key] = event
-                return None
+                return ""  # Photo queued — no warning needed, base.py sends nothing on empty str
 
             running_agent = self._running_agents.get(_quick_key)
             if running_agent is _AGENT_PENDING_SENTINEL:
@@ -1852,14 +1852,14 @@ class GatewayRunner:
                 adapter = self.adapters.get(source.platform)
                 if adapter:
                     adapter._pending_messages[_quick_key] = event
-                return None
+                return ""  # Message queued for pending-agent processing
             logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
             running_agent.interrupt(event.text)
             if _quick_key in self._pending_messages:
                 self._pending_messages[_quick_key] += "\n" + event.text
             else:
                 self._pending_messages[_quick_key] = event.text
-            return None
+            return ""  # Interrupt queued — no warning needed
 
         # Check for commands
         command = event.get_command()
@@ -1894,7 +1894,10 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
-        
+
+        if canonical == "coord":
+            return await self._handle_coord_command(event)
+
         if canonical == "stop":
             return await self._handle_stop_command(event)
         
@@ -1953,6 +1956,9 @@ class GatewayRunner:
         if canonical == "insights":
             return await self._handle_insights_command(event)
 
+        if canonical == "logs":
+            return await self._handle_logs_command(event)
+
         if canonical == "reload-mcp":
             return await self._handle_reload_mcp_command(event)
 
@@ -1970,6 +1976,10 @@ class GatewayRunner:
 
         if canonical == "resume":
             return await self._handle_resume_command(event)
+
+        # ── Research Hub commands ────────────────────────────────────────
+        if canonical in ("research", "research-recall", "research-save", "research-topics"):
+            return await self._handle_research_command(event, canonical)
 
         if canonical == "rollback":
             return await self._handle_rollback_command(event)
@@ -5303,6 +5313,361 @@ class GatewayRunner:
         if _lock:
             with _lock:
                 self._agent_cache.pop(session_key, None)
+
+    # ── Research Hub commands ────────────────────────────────────────────
+
+    async def _handle_research_command(self, event: MessageEvent, canonical: str) -> str:
+        """Handle /research, /research-recall, /research-save commands."""
+        args_str = event.get_command_args().strip()
+        import sys, logging as _logging
+        _logging.getLogger().setLevel(_logging.ERROR)
+
+        try:
+            sys.path.insert(0, str(__import__('pathlib').Path.home() / '.hermes' / 'autonomy'))
+            from autonomy import research_hub
+        except Exception as e:
+            return f"❌ Could not load research hub: {e}"
+
+        if canonical == "research":
+            if not args_str:
+                return ("**🔍 Research Hub**\n\n"
+                        "Usage:\n"
+                        "  `/research <query>` — Multi-engine search (auto-routes by query type)\n"
+                        "  `/research <url>`    — Deep-extract a URL (Crawl4AI + Firecrawl)\n\n"
+                        "**Available engines:** whoogle, ddgs, github, arxiv, crawl4ai, firecrawl, tavily\n\n"
+                        "**Auto-routing by query type:**\n"
+                        "  • code / github → github + whoogle\n"
+                        "  • academic / arxiv → arxiv + whoogle\n"
+                        "  • specs (BOLT/BLIP/NUT) → whoogle + ddgs + github\n"
+                        "  • bitcoin/lightning → whoogle + ddgs\n"
+                        "  • URL → crawl4ai + firecrawl extraction\n\n"
+                        "Example: `/research NUT-09 cashu token`")
+            query = args_str
+            result = research_hub.research(query, save_to_memory=True)
+            return research_hub.format_research(result)
+
+        if canonical == "research-recall":
+            if not args_str:
+                return "**🔍 Research Recall**\n\nUsage: `/research-recall <query>`\nSearches saved findings from research_memory.db."
+            try:
+                from autonomy import research_memory
+                results = research_memory.search(args_str, limit=10)
+                for rec in results:
+                    try:
+                        research_memory.increment_recall(rec["id"])
+                    except Exception:
+                        pass
+                return research_memory.format_results(results, args_str)
+            except Exception as e:
+                return f"❌ Recall failed: {e}"
+
+        if canonical == "research-save":
+            if " | " not in args_str and not args_str.startswith("{"):
+                return ("**💾 Research Save**\n\n"
+                        "Usage: `/research-save <topic> | <content>`\n\n"
+                        "Example: `/research-save NUT-09 | NUT-09 beschreibt Payment Proof Mechanism...`")
+            if " | " in args_str:
+                topic, content = args_str.split(" | ", 1)
+            else:
+                topic, content = "manual", args_str
+            try:
+                from autonomy.research_saver import save_research
+                fid = save_research(
+                    topic=topic.strip(),
+                    answer=content.strip(),
+                    role="manual",
+                    quality="medium",
+                )
+                return f"✅ Saved finding id={fid}: *{topic.strip()}*"
+            except Exception as e:
+                return f"❌ Save failed: {e}"
+
+        if canonical == "research-topics":
+            try:
+                from autonomy import research_memory
+                research_memory.init_db()
+                role_filter = args_str.strip() or None
+                topics = research_memory.list_topics(role=role_filter)
+                if not topics:
+                    return "📭 **No topics** in research memory yet. Run `/research <query>` first."
+                lines = [f"## 📚 Research Topics ({len(topics)} total)\n"]
+                for t in topics:
+                    role_tag = f"[{t.get('role', '')}]" if not role_filter else ""
+                    lines.append(f"  [{t['count']}x] **{t['topic']}** {role_tag} — {t['last'][:10]}")
+                return "\n".join(lines)
+            except Exception as e:
+                return f"❌ Failed to load topics: {e}"
+
+    # ── Coordinator commands ─────────────────────────────────────────────
+
+    async def _handle_coord_command(self, event: MessageEvent) -> str:
+        """Handle /coord <args> — Coordinator Mode sub-commands."""
+        args_str = event.get_command_args().strip()
+        if not args_str:
+            return (
+                "**🤖 Coordinator Mode**\n\n"
+                "Usage:\n"
+                "  `/coord <task>`       — Start a new async task\n"
+                "  `/coord status`       — Show active coordinator\n"
+                "  `/coord cancel`       — Cancel active task\n"
+                "  `/coord history`      — Show recent sessions\n"
+                "  `/coord score [id]`   — Score a session\n"
+                "  `/coord watch [5-60]` — Live-track progress via Discord (every N sec)\n"
+                "  `/coord parallel`     — Run all levels in parallel (coord-13)\n\n"
+                "Example: `/coord Recherchiere NUT-07 für ZapOut`"
+            )
+
+        parts = args_str.split()
+        sub_cmd = parts[0].lower()
+
+        # ── /coord status ────────────────────────────────────────────────
+        if sub_cmd == "status":
+            sys.path.insert(0, str(_hermes_home))
+            from autonomy.run_coordinator import cmd_status
+            import io, contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cmd_status()
+            output = buf.getvalue()
+            if "❌" in output and "Kein aktiver" in output:
+                return "📋 **Coordinator Status:** No active task"
+            lines = output.strip().split("\n")
+            return "📋 **Coordinator Status:**\n```\n" + "\n".join(lines[1:-1]) + "\n```"
+
+        # ── /coord cancel ────────────────────────────────────────────────
+        if sub_cmd == "cancel":
+            sys.path.insert(0, str(_hermes_home))
+            from autonomy.run_coordinator import cmd_cancel
+            import io, contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cmd_cancel()
+            output = buf.getvalue()
+            return f"✅ {output.strip()}"
+
+        # ── /coord history ──────────────────────────────────────────────
+        if sub_cmd == "history":
+            sys.path.insert(0, str(_hermes_home))
+            from autonomy.run_coordinator import cmd_history
+            import io, contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cmd_history()
+            output = buf.getvalue()
+            lines = output.strip().split("\n")[:20]
+            return "📜 **Discovery History:**\n```\n" + "\n".join(lines) + "\n```"
+
+        # ── /coord score [session] ───────────────────────────────────────
+        if sub_cmd == "score":
+            session_id = parts[1] if len(parts) > 1 else None
+            sys.path.insert(0, str(_hermes_home))
+            from autonomy.run_coordinator import cmd_score
+            import io, contextlib
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cmd_score(session_id)
+            output = buf.getvalue()
+            lines = output.strip().split("\n")[:15]
+            return "📊 **Session Scores:**\n```\n" + "\n".join(lines) + "\n```"
+
+        # ── /coord parallel ─────────────────────────────────────────────
+        if sub_cmd == "parallel":
+            task_desc = args_str[len("parallel"):].strip()
+            if not task_desc:
+                return (
+                    "**⚡ Parallel Mode**\n\n"
+                    "Usage: `/coord parallel <task>`\n\n"
+                    "_Runs all worker levels concurrently instead of sequentially._"
+                )
+            source = event.source
+            task_id = f"coord_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+
+            async def run_coord_parallel():
+                try:
+                    import os as _os, sys as _sys
+                    _sys.path.insert(0, str(_hermes_home))
+                    _os.environ["COORD_PARALLEL"] = "1"
+                    from autonomy.run_coordinator import run_coordinator
+                    await run_coordinator(task_desc)
+                except Exception as e:
+                    logger.exception("Parallel Coordinator %s failed: %s", task_id, e)
+                    adapter = self.adapters.get(source.platform)
+                    if adapter:
+                        await adapter.send(source.chat_id, f"❌ Parallel Coordinator {task_id} failed: {e}")
+
+            _task = asyncio.create_task(run_coord_parallel())
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
+            preview = task_desc[:60] + ("..." if len(task_desc) > 60 else "")
+            return (
+                f"⚡ **Parallel Coordinator gestartet:** \"{preview}\"\n"
+                f"_COORD_PARALLEL=1 — alle Levels gleichzeitig_\n\n"
+                f"Task ID: `{task_id}`"
+            )
+
+        # ── /coord watch ────────────────────────────────────────────────
+        if sub_cmd == "watch":
+            import asyncio as _asyncio
+
+            async def _watch_loop(source_platform, source_chat_id, thread_id):
+                _sys.path.insert(0, str(_hermes_home))
+                from autonomy.coordinator import load_state
+                from autonomy.discord_output import format_progress_embed, format_completion_embed
+                _adapter = self.adapters.get(source_platform)
+                last_state_hash = None
+                poll_count = 0
+                WATCH_INTERVAL = 15
+                MAX_WATCHES = 480
+
+                while poll_count < MAX_WATCHES:
+                    await _asyncio.sleep(WATCH_INTERVAL)
+                    poll_count += 1
+                    state = load_state()
+                    if state is None:
+                        if _adapter:
+                            await _adapter.send(
+                                source_chat_id, "📋 **Watch:** No active coordinator found.",
+                                metadata={"thread_id": thread_id} if thread_id else None)
+                        break
+                    if state.status in ("complete", "failed"):
+                        if _adapter:
+                            await _adapter.send(
+                                source_chat_id,
+                                f"🏁 **Coordinator `{state.task_id[:8]}` finished** — watch stopped.",
+                                metadata={"thread_id": thread_id} if thread_id else None)
+                        break
+                    current_hash = "|".join(
+                        f"{w.id}:{w.status}:{w.progress_pct}" for w in sorted(state.workers.values(), key=lambda x: x.id))
+                    if current_hash != last_state_hash:
+                        last_state_hash = current_hash
+                        if _adapter:
+                            await _adapter.send(
+                                source_chat_id,
+                                f"🔄 **Update** `{state.task_id[:8]}` — {state.progress()}% done",
+                                metadata={"thread_id": thread_id} if thread_id else None)
+                if poll_count >= MAX_WATCHES and _adapter:
+                    await _adapter.send(source_chat_id, "⏰ **Watch:** Auto-stopped after 2 hours.",
+                                        metadata={"thread_id": thread_id} if thread_id else None)
+
+            watch_interval = 15
+            if len(parts) > 1:
+                try:
+                    watch_interval = max(5, min(int(parts[1]), 60))
+                except ValueError:
+                    pass
+
+            watch_task = _asyncio.create_task(_watch_loop(source.platform, source.chat_id, source.thread_id))
+            self._background_tasks.add(watch_task)
+            watch_task.add_done_callback(self._background_tasks.discard)
+            return (
+                f"👀 **Watch** — Tracking coordinator progress every {watch_interval}s.\n"
+                f"I'll post updates when workers complete or make progress.\n"
+                f"_Auto-stops after 2 hours or when coordinator finishes._"
+            )
+
+        # ── /coord <task> — Start new task ───────────────────────────────
+        task_desc = args_str
+        source = event.source
+        task_id = f"coord_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+
+        async def run_coord():
+            try:
+                import sys as _sys
+                _sys.path.insert(0, str(_hermes_home))
+                from autonomy.run_coordinator import run_coordinator
+                await run_coordinator(task_desc)
+            except Exception as e:
+                logger.exception("Coordinator %s failed: %s", task_id, e)
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    await adapter.send(source.chat_id, f"❌ Coordinator task {task_id} failed: {e}")
+
+        _task = asyncio.create_task(run_coord())
+        self._background_tasks.add(_task)
+        _task.add_done_callback(self._background_tasks.discard)
+        preview = task_desc[:60] + ("..." if len(task_desc) > 60 else "")
+        return (
+            f'🤖 Coordinator gestartet: "{preview}"\n'
+            f'Task ID: `{task_id}`\n\n'
+            f'Ergebnisse erscheinen hier wenn fertig.'
+        )
+
+    # ── Logs command ─────────────────────────────────────────────────────
+
+    async def _handle_logs_command(self, event: MessageEvent) -> str:
+        """Handle /logs command — view Hermes logs with filtering."""
+        loop = asyncio.get_event_loop()
+        try:
+            args_str = event.text.strip()
+            parts = args_str.split()
+
+            all_logs = "--all" in parts or "--gateway" in parts
+            errors_only = "--errors" in parts
+            autonomy = "--autonomy" in parts
+            filter_text = None
+            level = None
+            since = None
+            limit = 50
+
+            for i, part in enumerate(parts):
+                if part == "--filter" and i + 1 < len(parts):
+                    filter_text = parts[i + 1]
+                elif part == "--level" and i + 1 < len(parts):
+                    level = parts[i + 1].upper()
+                elif part == "--since" and i + 1 < len(parts):
+                    try:
+                        since = int(parts[i + 1])
+                    except ValueError:
+                        pass
+                elif part == "--limit" and i + 1 < len(parts):
+                    try:
+                        limit = int(parts[i + 1])
+                    except ValueError:
+                        pass
+
+            def _run_logs():
+                import sys as _sys
+                _sys.path.insert(0, str(Path.home() / ".hermes"))
+                from autonomy.log_viewer import cmd_list
+                import argparse as _argparse
+                args = _argparse.Namespace(
+                    all=all_logs, errors=errors_only, autonomy=autonomy,
+                    filter=filter_text, level=level, since=since, limit=limit,
+                )
+                return cmd_list(args)
+
+            result = await loop.run_in_executor(None, _run_logs)
+
+            if autonomy:
+                return f"**📋 Recent Autonomy Sessions**\n\n{result}" if result else "No autonomy sessions found."
+
+            lines = result.split("\n") if result else []
+            if not lines:
+                return "No matching log entries found."
+
+            summary_lines = ["**📋 Hermes Logs**"]
+            if filter_text:
+                summary_lines.append(f"🔍 Filter: `{filter_text}`")
+            if level:
+                summary_lines.append(f"🏷 Level: `{level}`")
+            if since:
+                summary_lines.append(f"⏱ Last: {since}h")
+            summary_lines.append("")
+            for line in lines[:20]:
+                line = line.strip()
+                if not line:
+                    continue
+                if len(line) > 150:
+                    line = line[:147] + "..."
+                summary_lines.append(f"`{line}`")
+            if len(lines) > 20:
+                summary_lines.append(f"\n_...and {len(lines) - 20} more lines_")
+
+            return "\n".join(summary_lines)
+
+        except Exception as e:
+            logger.error("Logs command error: %s", e, exc_info=True)
+            return f"Error reading logs: {e}"
 
     async def _run_agent(
         self,
