@@ -5467,40 +5467,6 @@ class AIAgent:
 
         return api_kwargs
 
-    def _provider_needs_reasoning_content(self) -> bool:
-        """Return True when the provider benefits from reasoning_content in history.
-
-        Some providers (OpenRouter, Nous Portal) use reasoning_content and
-        reasoning_details for multi-turn reasoning continuity — the model
-        picks up where it left off thinking.  Sending these tokens back is
-        essential for coherent multi-step reasoning on those providers.
-
-        Other providers (Z.AI/GLM, local models, most direct APIs) either
-        ignore reasoning_content entirely or, worse, count it against the
-        context window without using it.  Stripping it saves thousands of
-        tokens per turn — critical for models like GLM-5-Turbo that
-        generate large thinking blocks by default.
-
-        Note: This is about history replay, not about enabling/disabling
-        reasoning (that's _supports_reasoning_extra_body).
-        """
-        # OpenRouter proxies to many reasoning-capable backends and uses
-        # reasoning_content / reasoning_details for multi-turn continuity.
-        if self._is_openrouter_url():
-            return True
-        # Nous Portal — reasoning is core to their offering.
-        if "nousresearch" in self._base_url_lower:
-            return True
-        # GitHub Models / GitHub Copilot — uses encrypted reasoning items.
-        if "models.github.ai" in self._base_url_lower or "api.githubcopilot.com" in self._base_url_lower:
-            return True
-        # Mistral API — supports reasoning natively.
-        if "api.mistral.ai" in self._base_url_lower:
-            return True
-        # All other providers (Z.AI, local models, etc.): strip reasoning
-        # from history to save context tokens.
-        return False
-
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
 
@@ -5775,6 +5741,7 @@ class AIAgent:
                 api_msg.pop("reasoning", None)
                 api_msg.pop("finish_reason", None)
                 api_msg.pop("_flush_sentinel", None)
+                api_msg.pop("_thinking_prefill", None)
                 if _needs_sanitize:
                     self._sanitize_tool_calls_for_strict_api(api_msg)
                 api_messages.append(api_msg)
@@ -6017,27 +5984,6 @@ class AIAgent:
                 store=self._todo_store,
             )
         elif function_name == "session_search":
-            # In honcho mode, route session_search to honcho_search instead of SQLite
-            _hcfg_ss = getattr(self, '_honcho_config', None)
-            _honcho_mgr_ss = getattr(self, '_honcho', None)
-            if _hcfg_ss and _hcfg_ss.memory_mode == "honcho" and _honcho_mgr_ss:
-                try:
-                    _result = _honcho_mgr_ss.search_context(
-                        query=function_args.get("query", ""),
-                        max_tokens=1500,
-                    )
-                    return json.dumps({
-                        "success": True,
-                        "source": "honcho",
-                        "results": _result,
-                    }) if _result else json.dumps({
-                        "success": False,
-                        "source": "honcho",
-                        "error": "No results from Honcho search.",
-                    })
-                except Exception as _e:
-                    logger.warning("honcho_search failed, falling back to SQLite: %s", _e)
-            # Fallback: use SQLite session_search
             if not self._session_db:
                 return json.dumps({"success": False, "error": "Session database not available."})
             from tools.session_search_tool import session_search as _session_search
@@ -6410,38 +6356,7 @@ class AIAgent:
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
             elif function_name == "session_search":
-                # In honcho mode, route to honcho_search instead of SQLite
-                _hcfg_ss2 = getattr(self, '_honcho_config', None)
-                _honcho_mgr_ss2 = getattr(self, '_honcho', None)
-                if _hcfg_ss2 and _hcfg_ss2.memory_mode == "honcho" and _honcho_mgr_ss2:
-                    try:
-                        _result2 = _honcho_mgr_ss2.search_context(
-                            query=function_args.get("query", ""),
-                            max_tokens=1500,
-                        )
-                        function_result = json.dumps({
-                            "success": True,
-                            "source": "honcho",
-                            "results": _result2,
-                        }) if _result2 else json.dumps({
-                            "success": False,
-                            "source": "honcho",
-                            "error": "No results from Honcho search.",
-                        })
-                    except Exception as _e2:
-                        logger.warning("honcho_search failed, falling back to SQLite: %s", _e2)
-                        if not self._session_db:
-                            function_result = json.dumps({"success": False, "error": "Session database not available."})
-                        else:
-                            from tools.session_search_tool import session_search as _session_search
-                            function_result = _session_search(
-                                query=function_args.get("query", ""),
-                                role_filter=function_args.get("role_filter"),
-                                limit=function_args.get("limit", 3),
-                                db=self._session_db,
-                                current_session_id=self.session_id,
-                            )
-                elif not self._session_db:
+                if not self._session_db:
                     function_result = json.dumps({"success": False, "error": "Session database not available."})
                 else:
                     from tools.session_search_tool import session_search as _session_search
@@ -6750,7 +6665,7 @@ class AIAgent:
             api_messages = []
             for msg in messages:
                 api_msg = msg.copy()
-                for internal_field in ("reasoning", "finish_reason"):
+                for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
                     api_msg.pop(internal_field, None)
                 if _needs_sanitize:
                     self._sanitize_tool_calls_for_strict_api(api_msg)
@@ -6942,6 +6857,7 @@ class AIAgent:
         self._empty_content_retries = 0
         self._incomplete_scratchpad_retries = 0
         self._codex_incomplete_retries = 0
+        self._thinking_prefill_retries = 0
         self._last_content_with_tools = None
         self._mute_post_response = False
         self._surrogate_sanitized = False
@@ -7274,15 +7190,9 @@ class AIAgent:
 
                 # For ALL assistant messages, pass reasoning back to the API
                 # This ensures multi-turn reasoning context is preserved
-                # — BUT only for providers that actually use it.
-                # Reasoning tokens are expensive and can consume the entire
-                # output budget on providers like Z.AI (GLM-5-Turbo) that
-                # generate thinking blocks by default.  Stripping them from
-                # the history saves thousands of context tokens per turn.
-                _passes_reasoning_content = self._provider_needs_reasoning_content()
                 if msg.get("role") == "assistant":
                     reasoning_text = msg.get("reasoning")
-                    if reasoning_text and _passes_reasoning_content:
+                    if reasoning_text:
                         # Add reasoning_content for API compatibility (Moonshot AI, Novita, OpenRouter)
                         api_msg["reasoning_content"] = reasoning_text
 
@@ -7293,6 +7203,8 @@ class AIAgent:
                 # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
                 if "finish_reason" in api_msg:
                     api_msg.pop("finish_reason")
+                # Strip internal thinking-prefill marker
+                api_msg.pop("_thinking_prefill", None)
                 # Strip Codex Responses API fields (call_id, response_item_id) for
                 # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
                 # Uses new dicts so the internal messages list retains the fields
@@ -7301,10 +7213,6 @@ class AIAgent:
                     self._sanitize_tool_calls_for_strict_api(api_msg)
                 # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
                 # The signature field helps maintain reasoning continuity
-                if not _passes_reasoning_content:
-                    # Also strip reasoning_details for providers that don't need
-                    # reasoning continuity — these opaque blobs can be large.
-                    api_msg.pop("reasoning_details", None)
                 api_messages.append(api_msg)
 
             # Build the final system message: cached prompt + ephemeral system prompt.
@@ -8831,6 +8739,15 @@ class AIAgent:
                             if clean:
                                 self._vprint(f"  ┊ 💬 {clean}")
                     
+                    # Pop thinking-only prefill message(s) before appending
+                    # (tool-call path — same rationale as the final-response path).
+                    while (
+                        messages
+                        and isinstance(messages[-1], dict)
+                        and messages[-1].get("_thinking_prefill")
+                    ):
+                        messages.pop()
+
                     messages.append(assistant_msg)
 
                     # Close any open streaming display (response box, reasoning
@@ -8944,11 +8861,36 @@ class AIAgent:
                             self._response_was_previewed = True
                             break
 
-                        # Reasoning-only response: the model produced thinking
-                        # but no visible content.  This is a valid response —
-                        # keep reasoning in its own field and set content to
-                        # "(empty)" so every provider accepts the message.
-                        # No retries needed.
+                        # ── Thinking-only prefill continuation ──────────
+                        # The model produced structured reasoning (via API
+                        # fields) but no visible text content.  Rather than
+                        # giving up, append the assistant message as-is and
+                        # continue — the model will see its own reasoning
+                        # on the next turn and produce the text portion.
+                        # Inspired by clawdbot's "incomplete-text" recovery.
+                        _has_structured = bool(
+                            getattr(assistant_message, "reasoning", None)
+                            or getattr(assistant_message, "reasoning_content", None)
+                            or getattr(assistant_message, "reasoning_details", None)
+                        )
+                        if _has_structured and self._thinking_prefill_retries < 2:
+                            self._thinking_prefill_retries += 1
+                            self._vprint(
+                                f"{self.log_prefix}↻ Thinking-only response — "
+                                f"prefilling to continue "
+                                f"({self._thinking_prefill_retries}/2)"
+                            )
+                            interim_msg = self._build_assistant_message(
+                                assistant_message, "incomplete"
+                            )
+                            interim_msg["_thinking_prefill"] = True
+                            messages.append(interim_msg)
+                            self._session_messages = messages
+                            self._save_session_log(messages)
+                            continue
+
+                        # Exhausted prefill attempts or no structured
+                        # reasoning — fall through to "(empty)" terminal.
                         reasoning_text = self._extract_reasoning(assistant_message)
                         assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                         assistant_msg["content"] = "(empty)"
@@ -8967,6 +8909,7 @@ class AIAgent:
                     if hasattr(self, '_empty_content_retries'):
                         self._empty_content_retries = 0
                     self._last_empty_content_signature = None
+                    self._thinking_prefill_retries = 0
 
                     if (
                         self.api_mode == "codex_responses"
@@ -9005,7 +8948,18 @@ class AIAgent:
                     final_response = self._strip_think_blocks(final_response).strip()
                     
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)
-                    
+
+                    # Pop thinking-only prefill message(s) before appending
+                    # the final response.  This avoids consecutive assistant
+                    # messages which break strict-alternation providers
+                    # (Anthropic Messages API) and keeps history clean.
+                    while (
+                        messages
+                        and isinstance(messages[-1], dict)
+                        and messages[-1].get("_thinking_prefill")
+                    ):
+                        messages.pop()
+
                     messages.append(final_msg)
                     
                     if not self.quiet_mode:
@@ -9345,18 +9299,11 @@ def main(
     disabled_toolsets_list = None
     
     if enabled_toolsets:
-        # Fire may pass comma-separated string as tuple
-        if isinstance(enabled_toolsets, (tuple, list)):
-            enabled_toolsets_list = [str(t).strip() for t in enabled_toolsets]
-        else:
-            enabled_toolsets_list = [t.strip() for t in enabled_toolsets.split(",")]
+        enabled_toolsets_list = [t.strip() for t in enabled_toolsets.split(",")]
         print(f"🎯 Enabled toolsets: {enabled_toolsets_list}")
     
     if disabled_toolsets:
-        if isinstance(disabled_toolsets, (tuple, list)):
-            disabled_toolsets_list = [str(t).strip() for t in disabled_toolsets]
-        else:
-            disabled_toolsets_list = [t.strip() for t in disabled_toolsets.split(",")]
+        disabled_toolsets_list = [t.strip() for t in disabled_toolsets.split(",")]
         print(f"🚫 Disabled toolsets: {disabled_toolsets_list}")
     
     if save_trajectories:

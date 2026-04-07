@@ -58,4 +58,3 @@ mini-swe-agent/
 # Nix
 .direnv/
 result
-repos/lnd.git
