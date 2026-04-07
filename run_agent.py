@@ -20,7 +20,6 @@ Usage:
     response = agent.run_conversation("Tell me about the latest Python updates")
 """
 
-import atexit
 import asyncio
 import base64
 import concurrent.futures
@@ -36,7 +35,6 @@ import sys
 import tempfile
 import time
 import threading
-import weakref
 from types import SimpleNamespace
 import uuid
 from typing import List, Dict, Any, Optional
@@ -76,6 +74,7 @@ from tools.browser_tool import cleanup_browser
 from hermes_constants import OPENROUTER_BASE_URL
 
 # Agent internals extracted to agent/ package for modularity
+from agent.memory_manager import build_memory_context_block
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
@@ -88,8 +87,9 @@ from agent.model_metadata import (
     save_context_length, is_local_endpoint,
 )
 from agent.context_compressor import ContextCompressor
+from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE
+from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.display import (
     KawaiiSpinner, build_tool_preview as _build_tool_preview,
@@ -103,12 +103,6 @@ from agent.trajectory import (
 )
 from utils import atomic_json_write, env_var_enabled
 
-HONCHO_TOOL_NAMES = {
-    "honcho_context",
-    "honcho_profile",
-    "honcho_search",
-    "honcho_conclude",
-}
 
 
 class _SafeWriter:
@@ -221,9 +215,6 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "ha_get_state",
     "ha_list_entities",
     "ha_list_services",
-    "honcho_context",
-    "honcho_profile",
-    "honcho_search",
     "read_file",
     "search_files",
     "session_search",
@@ -340,44 +331,13 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     return left_parts[:common_len] == right_parts[:common_len]
 
 
-def _inject_honcho_turn_context(content, turn_context: str):
-    """Append Honcho recall to the current-turn user message without mutating history.
 
-    The returned content is sent to the API for this turn only. Keeping Honcho
-    recall out of the system prompt preserves the stable cache prefix while
-    still giving the model continuity context.
-    """
-    if not turn_context:
-        return content
+_SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
-    note = (
-        "[System note: The following Honcho memory was retrieved from prior "
-        "sessions. It is continuity context for this turn only, not new user "
-        "input.]\n\n"
-        f"{turn_context}"
-    )
-
-    if isinstance(content, list):
-        return list(content) + [{"type": "text", "text": note}]
-
-    text = "" if content is None else str(content)
-    if not text.strip():
-        return note
-    return f"{text}\n\n{note}"
-
-
-# Budget warning text patterns injected by _get_budget_warning().
 _BUDGET_WARNING_RE = re.compile(
     r"\[BUDGET(?:\s+WARNING)?:\s+Iteration\s+\d+/\d+\..*?\]",
     re.DOTALL,
 )
-
-
-# Regex to match lone surrogate code points (U+D800..U+DFFF).
-# These are invalid in UTF-8 and cause UnicodeEncodeError when the OpenAI SDK
-# serialises messages to JSON.  Common source: clipboard paste from Google Docs
-# or other rich-text editors on some platforms.
-_SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
 
 def _sanitize_surrogates(text: str) -> str:
@@ -445,6 +405,68 @@ def _strip_budget_warnings_from_history(messages: list) -> None:
             msg["content"] = cleaned
 
 
+# =========================================================================
+# Large tool result handler — save oversized output to temp file
+# =========================================================================
+
+# Threshold at which tool results are saved to a file instead of kept inline.
+# 100K chars ≈ 25K tokens — generous for any reasonable output but prevents
+# catastrophic context explosions.
+_LARGE_RESULT_CHARS = 100_000
+
+# How many characters of the original result to include as an inline preview
+# so the model has immediate context about what the tool returned.
+_LARGE_RESULT_PREVIEW_CHARS = 1_500
+
+
+def _save_oversized_tool_result(function_name: str, function_result: str) -> str:
+    """Replace oversized tool results with a file reference + preview.
+
+    When a tool returns more than ``_LARGE_RESULT_CHARS`` characters, the full
+    content is written to a temporary file under ``HERMES_HOME/cache/tool_responses/``
+    and the result sent to the model is replaced with:
+      • a brief head preview  (first ``_LARGE_RESULT_PREVIEW_CHARS`` chars)
+      • the file path so the model can use ``read_file`` / ``search_files``
+
+    Falls back to destructive truncation if the file write fails.
+    """
+    original_len = len(function_result)
+    if original_len <= _LARGE_RESULT_CHARS:
+        return function_result
+
+    # Build the target directory
+    try:
+        response_dir = os.path.join(get_hermes_home(), "cache", "tool_responses")
+        os.makedirs(response_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        # Sanitize tool name for use in filename
+        safe_name = re.sub(r"[^\w\-]", "_", function_name)[:40]
+        filename = f"{safe_name}_{timestamp}.txt"
+        filepath = os.path.join(response_dir, filename)
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(function_result)
+
+        preview = function_result[:_LARGE_RESULT_PREVIEW_CHARS]
+        return (
+            f"{preview}\n\n"
+            f"[Large tool response: {original_len:,} characters total — "
+            f"only the first {_LARGE_RESULT_PREVIEW_CHARS:,} shown above. "
+            f"Full output saved to: {filepath}\n"
+            f"Use read_file or search_files on that path to access the rest.]"
+        )
+    except Exception as exc:
+        # Fall back to destructive truncation if file write fails
+        logger.warning("Failed to save large tool result to file: %s", exc)
+        return (
+            function_result[:_LARGE_RESULT_CHARS]
+            + f"\n\n[Truncated: tool response was {original_len:,} chars, "
+            f"exceeding the {_LARGE_RESULT_CHARS:,} char limit. "
+            f"File save failed: {exc}]"
+        )
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -504,12 +526,11 @@ class AIAgent:
         reasoning_config: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
+        user_id: str = None,
         skip_context_files: bool = False,
         skip_memory: bool = False,
         session_db=None,
-        honcho_session_key: str = None,
-        honcho_manager=None,
-        honcho_config=None,
+        parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
@@ -556,10 +577,6 @@ class AIAgent:
             skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
                 into the system prompt. Use this for batch processing and data generation to avoid
                 polluting trajectories with user-specific persona or project instructions.
-            honcho_session_key (str): Session key for Honcho integration (e.g., "telegram:123456" or CLI session_id).
-                When provided and Honcho is enabled in config, enables persistent cross-session user modeling.
-            honcho_manager: Optional shared HonchoSessionManager owned by the caller.
-            honcho_config: Optional HonchoClientConfig corresponding to honcho_manager.
         """
         _install_safe_stdio()
 
@@ -574,6 +591,7 @@ class AIAgent:
         self.quiet_mode = quiet_mode
         self.ephemeral_system_prompt = ephemeral_system_prompt
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
+        self._user_id = user_id  # Platform user identifier (gateway sessions)
         # Pluggable print function — CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
         # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -636,7 +654,7 @@ class AIAgent:
         self.stream_delta_callback = stream_delta_callback
         self.status_callback = status_callback
         self.tool_gen_callback = tool_gen_callback
-        self._last_reported_tool = None  # Track for "new tool" mode
+
         
         # Tool execution state — allows _vprint during tool execution
         # even when stream consumers are registered (no tokens streaming then)
@@ -690,77 +708,32 @@ class AIAgent:
         # status_callback for gateway platforms.  Does NOT inject into messages.
         self._context_pressure_warned = False
 
-        # Persistent error log -- always writes WARNING+ to ~/.hermes/logs/errors.log
-        # so tool failures, API errors, etc. are inspectable after the fact.
-        # In gateway mode, each incoming message creates a new AIAgent instance,
-        # while the root logger is process-global. Re-adding the same errors.log
-        # handler would cause each warning/error line to be written multiple times.
-        from logging.handlers import RotatingFileHandler
-        root_logger = logging.getLogger()
-        error_log_dir = _hermes_home / "logs"
-        error_log_path = error_log_dir / "errors.log"
-        resolved_error_log_path = error_log_path.resolve()
-        has_errors_log_handler = any(
-            isinstance(handler, RotatingFileHandler)
-            and Path(getattr(handler, "baseFilename", "")).resolve() == resolved_error_log_path
-            for handler in root_logger.handlers
-        )
-        from agent.redact import RedactingFormatter
-        if not has_errors_log_handler:
-            error_log_dir.mkdir(parents=True, exist_ok=True)
-            error_file_handler = RotatingFileHandler(
-                error_log_path, maxBytes=2 * 1024 * 1024, backupCount=2,
-            )
-            error_file_handler.setLevel(logging.WARNING)
-            error_file_handler.setFormatter(RedactingFormatter(
-                '%(asctime)s %(levelname)s %(name)s: %(message)s',
-            ))
-            root_logger.addHandler(error_file_handler)
+        # Activity tracking — updated on each API call, tool execution, and
+        # stream chunk.  Used by the gateway timeout handler to report what the
+        # agent was doing when it was killed, and by the "still working"
+        # notifications to show progress.
+        self._last_activity_ts: float = time.time()
+        self._last_activity_desc: str = "initializing"
+        self._current_tool: str | None = None
+        self._api_call_count: int = 0
+
+        # Centralized logging — agent.log (INFO+) and errors.log (WARNING+)
+        # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
+        # (which creates a new AIAgent per message) won't duplicate handlers.
+        from hermes_logging import setup_logging, setup_verbose_logging
+        setup_logging(hermes_home=_hermes_home)
 
         if self.verbose_logging:
-            logging.basicConfig(
-                level=logging.DEBUG,
-                format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                datefmt='%H:%M:%S'
-            )
-            for handler in logging.getLogger().handlers:
-                handler.setFormatter(RedactingFormatter(
-                    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    datefmt='%H:%M:%S',
-                ))
-            # Keep third-party libraries at WARNING level to reduce noise
-            # We have our own retry and error logging that's more informative
-            logging.getLogger('openai').setLevel(logging.WARNING)
-            logging.getLogger('openai._base_client').setLevel(logging.WARNING)
-            logging.getLogger('httpx').setLevel(logging.WARNING)
-            logging.getLogger('httpcore').setLevel(logging.WARNING)
-            logging.getLogger('asyncio').setLevel(logging.WARNING)
-            # Suppress Modal/gRPC related debug spam
-            logging.getLogger('hpack').setLevel(logging.WARNING)
-            logging.getLogger('hpack.hpack').setLevel(logging.WARNING)
-            logging.getLogger('grpc').setLevel(logging.WARNING)
-            logging.getLogger('modal').setLevel(logging.WARNING)
-            logging.getLogger('rex-deploy').setLevel(logging.INFO)  # Keep INFO for sandbox status
+            setup_verbose_logging()
             logger.info("Verbose logging enabled (third-party library logs suppressed)")
         else:
-            # Set logging to INFO level for important messages only
-            logging.basicConfig(
-                level=logging.INFO,
-                format='%(asctime)s - %(levelname)s - %(message)s',
-                datefmt='%H:%M:%S'
-            )
-            # Suppress noisy library logging
-            logging.getLogger('openai').setLevel(logging.ERROR)
-            logging.getLogger('openai._base_client').setLevel(logging.ERROR)
-            logging.getLogger('httpx').setLevel(logging.ERROR)
-            logging.getLogger('httpcore').setLevel(logging.ERROR)
             if self.quiet_mode:
                 # In quiet mode (CLI default), suppress all tool/infra log
-                # noise. The TUI has its own rich display for status; logger
-                # INFO/WARNING messages just clutter it.
+                # noise on the *console*. The TUI has its own rich display
+                # for status; logger INFO/WARNING messages just clutter it.
+                # File handlers (agent.log, errors.log) still capture everything.
                 for quiet_logger in [
                     'tools',               # all tools.* (terminal, browser, web, file, etc.)
-                    
                     'run_agent',            # agent runner internals
                     'trajectory_compressor',
                     'cron',                 # scheduler (only relevant in daemon mode)
@@ -1009,6 +982,7 @@ class AIAgent:
         
         # SQLite session store (optional -- provided by CLI or gateway)
         self._session_db = session_db
+        self._parent_session_id = parent_session_id
         self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
         if self._session_db:
             try:
@@ -1022,6 +996,7 @@ class AIAgent:
                         "max_tokens": max_tokens,
                     },
                     user_id=None,
+                    parent_session_id=self._parent_session_id,
                 )
             except Exception as e:
                 # Transient SQLite lock contention (e.g. CLI and gateway writing
@@ -1070,75 +1045,83 @@ class AIAgent:
             except Exception:
                 pass  # Memory is optional -- don't break agent init
         
-        # Honcho AI-native memory (cross-session user modeling)
-        # Reads $HERMES_HOME/honcho.json (instance) or ~/.honcho/config.json (global).
-        self._honcho = None  # HonchoSessionManager | None
-        self._honcho_session_key = honcho_session_key
-        self._honcho_config = None  # HonchoClientConfig | None
-        self._honcho_exit_hook_registered = False
+
+
+        # Memory provider plugin (external — one at a time, alongside built-in)
+        # Reads memory.provider from config to select which plugin to activate.
+        self._memory_manager = None
         if not skip_memory:
             try:
-                if honcho_manager is not None:
-                    hcfg = honcho_config or getattr(honcho_manager, "_config", None)
-                    self._honcho_config = hcfg
-                    if hcfg and self._honcho_should_activate(hcfg):
-                        self._honcho = honcho_manager
-                        self._activate_honcho(
-                            hcfg,
-                            enabled_toolsets=enabled_toolsets,
-                            disabled_toolsets=disabled_toolsets,
-                            session_db=session_db,
-                        )
-                else:
-                    from honcho_integration.client import HonchoClientConfig, get_honcho_client
-                    hcfg = HonchoClientConfig.from_global_config()
-                    self._honcho_config = hcfg
-                    if self._honcho_should_activate(hcfg):
-                        from honcho_integration.session import HonchoSessionManager
-                        client = get_honcho_client(hcfg)
-                        self._honcho = HonchoSessionManager(
-                            honcho=client,
-                            config=hcfg,
-                            context_tokens=hcfg.context_tokens,
-                        )
-                        self._activate_honcho(
-                            hcfg,
-                            enabled_toolsets=enabled_toolsets,
-                            disabled_toolsets=disabled_toolsets,
-                            session_db=session_db,
-                        )
+                _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
+
+                # Auto-migrate: if Honcho was actively configured (enabled +
+                # credentials) but memory.provider is not set, activate the
+                # honcho plugin automatically.  Just having the config file
+                # is not enough — the user may have disabled Honcho or the
+                # file may be from a different tool.
+                if not _mem_provider_name:
+                    try:
+                        from plugins.memory.honcho.client import HonchoClientConfig as _HCC
+                        _hcfg = _HCC.from_global_config()
+                        if _hcfg.enabled and (_hcfg.api_key or _hcfg.base_url):
+                            _mem_provider_name = "honcho"
+                            # Persist so this only auto-migrates once
+                            try:
+                                from hermes_cli.config import load_config as _lc, save_config as _sc
+                                _cfg = _lc()
+                                _cfg.setdefault("memory", {})["provider"] = "honcho"
+                                _sc(_cfg)
+                            except Exception:
+                                pass
+                            if not self.quiet_mode:
+                                print("  ✓ Auto-migrated Honcho to memory provider plugin.")
+                                print("    Your config and data are preserved.\n")
+                    except Exception:
+                        pass
+
+                if _mem_provider_name:
+                    from agent.memory_manager import MemoryManager as _MemoryManager
+                    from plugins.memory import load_memory_provider as _load_mem
+                    self._memory_manager = _MemoryManager()
+                    _mp = _load_mem(_mem_provider_name)
+                    if _mp and _mp.is_available():
+                        self._memory_manager.add_provider(_mp)
+                    if self._memory_manager.providers:
+                        from hermes_constants import get_hermes_home as _ghh
+                        _init_kwargs = {
+                            "session_id": self.session_id,
+                            "platform": platform or "cli",
+                            "hermes_home": str(_ghh()),
+                            "agent_context": "primary",
+                        }
+                        # Thread gateway user identity for per-user memory scoping
+                        if self._user_id:
+                            _init_kwargs["user_id"] = self._user_id
+                        # Profile identity for per-profile provider scoping
+                        try:
+                            from hermes_cli.profiles import get_active_profile_name
+                            _profile = get_active_profile_name()
+                            _init_kwargs["agent_identity"] = _profile
+                            _init_kwargs["agent_workspace"] = "hermes"
+                        except Exception:
+                            pass
+                        self._memory_manager.initialize_all(**_init_kwargs)
+                        logger.info("Memory provider '%s' activated", _mem_provider_name)
                     else:
-                        if not hcfg.enabled:
-                            logger.debug("Honcho disabled in global config")
-                        elif not (hcfg.api_key or hcfg.base_url):
-                            logger.debug("Honcho enabled but no API key or base URL configured")
-                        else:
-                            logger.debug("Honcho enabled but missing API key or disabled in config")
-            except Exception as e:
-                logger.warning("Honcho init failed — memory disabled: %s", e)
-                print(f"  Honcho init failed: {e}")
-                print("  Run 'hermes honcho setup' to reconfigure.")
-                self._honcho = None
+                        logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
+                        self._memory_manager = None
+            except Exception as _mpe:
+                logger.warning("Memory provider plugin init failed: %s", _mpe)
+                self._memory_manager = None
 
-        # Tools are initially discovered before Honcho activation. If Honcho
-        # stays inactive, remove any stale honcho_* tools from prior process state.
-        if not self._honcho:
-            self._strip_honcho_tools_from_surface()
-
-        # Gate local memory writes based on per-peer memory modes.
-        # AI peer governs MEMORY.md; user peer governs USER.md.
-        # "honcho" = Honcho only, disable local writes.
-        if self._honcho_config and self._honcho:
-            _hcfg = self._honcho_config
-            _agent_mode = _hcfg.peer_memory_mode(_hcfg.ai_peer)
-            _user_mode = _hcfg.peer_memory_mode(_hcfg.peer_name or "user")
-            if _agent_mode == "honcho":
-                self._memory_flush_min_turns = 0
-                self._memory_enabled = False
-                logger.debug("peer %s memory_mode=honcho: local MEMORY.md writes disabled", _hcfg.ai_peer)
-            if _user_mode == "honcho":
-                self._user_profile_enabled = False
-                logger.debug("peer %s memory_mode=honcho: local USER.md writes disabled", _hcfg.peer_name or "user")
+        # Inject memory provider tool schemas into the tool surface
+        if self._memory_manager and self.tools is not None:
+            for _schema in self._memory_manager.get_all_tool_schemas():
+                _wrapped = {"type": "function", "function": _schema}
+                self.tools.append(_wrapped)
+                _tname = _schema.get("name", "")
+                if _tname:
+                    self.valid_tool_names.add(_tname)
 
         # Skills config: nudge interval for skill creation reminders
         self._skill_nudge_interval = 10
@@ -1214,6 +1197,9 @@ class AIAgent:
             provider=self.provider,
         )
         self.compression_enabled = compression_enabled
+        self._subdirectory_hints = SubdirectoryHintTracker(
+            working_dir=os.getenv("TERMINAL_CWD") or None,
+        )
         self._user_turn_count = 0
 
         # Cumulative token usage for the session
@@ -1310,6 +1296,129 @@ class AIAgent:
             # Iterative summary from previous session must not bleed into new one (#2635)
             self.context_compressor._previous_summary = None
     
+    def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
+        """Switch the model/provider in-place for a live agent.
+
+        Called by the /model command handlers (CLI and gateway) after
+        ``model_switch.switch_model()`` has resolved credentials and
+        validated the model.  This method performs the actual runtime
+        swap: rebuilding clients, updating caching flags, and refreshing
+        the context compressor.
+
+        The implementation mirrors ``_try_activate_fallback()`` for the
+        client-swap logic but also updates ``_primary_runtime`` so the
+        change persists across turns (unlike fallback which is
+        turn-scoped).
+        """
+        import logging
+        from hermes_cli.providers import determine_api_mode
+
+        # ── Determine api_mode if not provided ──
+        if not api_mode:
+            api_mode = determine_api_mode(new_provider, base_url)
+
+        old_model = self.model
+        old_provider = self.provider
+
+        # ── Swap core runtime fields ──
+        self.model = new_model
+        self.provider = new_provider
+        self.base_url = base_url or self.base_url
+        self.api_mode = api_mode
+        if api_key:
+            self.api_key = api_key
+
+        # ── Build new client ──
+        if api_mode == "anthropic_messages":
+            from agent.anthropic_adapter import (
+                build_anthropic_client,
+                resolve_anthropic_token,
+                _is_oauth_token,
+            )
+            effective_key = api_key or self.api_key or resolve_anthropic_token() or ""
+            self.api_key = effective_key
+            self._anthropic_api_key = effective_key
+            self._anthropic_base_url = base_url or getattr(self, "_anthropic_base_url", None)
+            self._anthropic_client = build_anthropic_client(
+                effective_key, self._anthropic_base_url,
+            )
+            self._is_anthropic_oauth = _is_oauth_token(effective_key)
+            self.client = None
+            self._client_kwargs = {}
+        else:
+            effective_key = api_key or self.api_key
+            effective_base = base_url or self.base_url
+            self._client_kwargs = {
+                "api_key": effective_key,
+                "base_url": effective_base,
+            }
+            self.client = self._create_openai_client(
+                dict(self._client_kwargs),
+                reason="switch_model",
+                shared=True,
+            )
+
+        # ── Re-evaluate prompt caching ──
+        is_native_anthropic = api_mode == "anthropic_messages"
+        self._use_prompt_caching = (
+            ("openrouter" in (self.base_url or "").lower() and "claude" in new_model.lower())
+            or is_native_anthropic
+        )
+
+        # ── Update context compressor ──
+        if hasattr(self, "context_compressor") and self.context_compressor:
+            from agent.model_metadata import get_model_context_length
+            new_context_length = get_model_context_length(
+                self.model,
+                base_url=self.base_url,
+                api_key=self.api_key,
+                provider=self.provider,
+            )
+            self.context_compressor.model = self.model
+            self.context_compressor.base_url = self.base_url
+            self.context_compressor.api_key = self.api_key
+            self.context_compressor.provider = self.provider
+            self.context_compressor.context_length = new_context_length
+            self.context_compressor.threshold_tokens = int(
+                new_context_length * self.context_compressor.threshold_percent
+            )
+
+        # ── Invalidate cached system prompt so it rebuilds next turn ──
+        self._cached_system_prompt = None
+
+        # ── Update _primary_runtime so the change persists across turns ──
+        _cc = self.context_compressor if hasattr(self, "context_compressor") and self.context_compressor else None
+        self._primary_runtime = {
+            "model": self.model,
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "api_mode": self.api_mode,
+            "api_key": getattr(self, "api_key", ""),
+            "client_kwargs": dict(self._client_kwargs),
+            "use_prompt_caching": self._use_prompt_caching,
+            "compressor_model": _cc.model if _cc else self.model,
+            "compressor_base_url": _cc.base_url if _cc else self.base_url,
+            "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",
+            "compressor_provider": _cc.provider if _cc else self.provider,
+            "compressor_context_length": _cc.context_length if _cc else 0,
+            "compressor_threshold_tokens": _cc.threshold_tokens if _cc else 0,
+        }
+        if api_mode == "anthropic_messages":
+            self._primary_runtime.update({
+                "anthropic_api_key": self._anthropic_api_key,
+                "anthropic_base_url": self._anthropic_base_url,
+                "is_anthropic_oauth": self._is_anthropic_oauth,
+            })
+
+        # ── Reset fallback state ──
+        self._fallback_activated = False
+        self._fallback_index = 0
+
+        logging.info(
+            "Model switched in-place: %s (%s) -> %s (%s)",
+            old_model, old_provider, new_model, new_provider,
+        )
+
     def _safe_print(self, *args, **kwargs):
         """Print that silently handles broken pipes / closed stdout.
 
@@ -1348,6 +1457,25 @@ class AIAgent:
             return
         self._safe_print(*args, **kwargs)
 
+    def _should_start_quiet_spinner(self) -> bool:
+        """Return True when quiet-mode spinner output has a safe sink.
+
+        In headless/stdio-protocol environments, a raw spinner with no custom
+        ``_print_fn`` falls back to ``sys.stdout`` and can corrupt protocol
+        streams such as ACP JSON-RPC. Allow quiet spinners only when either:
+        - output is explicitly rerouted via ``_print_fn``; or
+        - stdout is a real TTY.
+        """
+        if self._print_fn is not None:
+            return True
+        stream = getattr(sys, "stdout", None)
+        if stream is None:
+            return False
+        try:
+            return bool(stream.isatty())
+        except (AttributeError, ValueError, OSError):
+            return False
+
     def _emit_status(self, message: str) -> None:
         """Emit a lifecycle status message to both CLI and gateway channels.
 
@@ -1376,10 +1504,6 @@ class AIAgent:
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
         return "openrouter" in self._base_url_lower
-
-    def _is_anthropic_url(self) -> bool:
-        """Return True when the base URL targets Anthropic (native or /anthropic proxy path)."""
-        return "api.anthropic.com" in self._base_url_lower or self._base_url_lower.rstrip("/").endswith("/anthropic")
 
     def _max_tokens_param(self, value: int) -> dict:
         """Return the correct max tokens kwarg for the current provider.
@@ -1566,74 +1690,6 @@ class AIAgent:
         
         return None
 
-    def _classify_empty_content_response(
-        self,
-        assistant_message,
-        *,
-        finish_reason: Optional[str],
-        approx_tokens: int,
-        api_messages: List[Dict[str, Any]],
-        conversation_history: Optional[List[Dict[str, Any]]],
-    ) -> Dict[str, Any]:
-        """Classify think-only/empty responses so we can retry, compress, or salvage.
-
-        We intentionally do NOT short-circuit all structured-reasoning responses.
-        Prior discussion/PR history shows some models recover on retry. Instead we:
-        - compress immediately when the pattern looks like implicit context pressure
-        - salvage reasoning early when the same reasoning-only payload repeats
-        - otherwise preserve the normal retry path
-        """
-        reasoning_text = self._extract_reasoning(assistant_message)
-        has_structured_reasoning = bool(
-            getattr(assistant_message, "reasoning", None)
-            or getattr(assistant_message, "reasoning_content", None)
-            or getattr(assistant_message, "reasoning_details", None)
-        )
-        content = getattr(assistant_message, "content", None) or ""
-        stripped_content = self._strip_think_blocks(content).strip()
-        signature = (
-            content,
-            reasoning_text or "",
-            bool(has_structured_reasoning),
-            finish_reason or "",
-        )
-        repeated_signature = signature == getattr(self, "_last_empty_content_signature", None)
-
-        compressor = getattr(self, "context_compressor", None)
-        ctx_len = getattr(compressor, "context_length", 0) or 0
-        threshold_tokens = getattr(compressor, "threshold_tokens", 0) or 0
-        is_large_session = bool(
-            (ctx_len and approx_tokens >= max(int(ctx_len * 0.4), threshold_tokens))
-            or len(api_messages) > 80
-        )
-        is_local_custom = is_local_endpoint(getattr(self, "base_url", "") or "")
-        is_resumed = bool(conversation_history)
-        context_pressure_signals = any(
-            [
-                finish_reason == "length",
-                getattr(compressor, "_context_probed", False),
-                is_large_session,
-                is_resumed,
-            ]
-        )
-        should_compress = bool(
-            self.compression_enabled
-            and is_local_custom
-            and context_pressure_signals
-            and not stripped_content
-        )
-
-        self._last_empty_content_signature = signature
-        return {
-            "reasoning_text": reasoning_text,
-            "has_structured_reasoning": has_structured_reasoning,
-            "repeated_signature": repeated_signature,
-            "should_compress": should_compress,
-            "is_local_custom": is_local_custom,
-            "is_large_session": is_large_session,
-            "is_resumed": is_resumed,
-        }
-    
     def _cleanup_task_resources(self, task_id: str) -> None:
         """Clean up VM and browser resources for a given task."""
         try:
@@ -2180,6 +2236,87 @@ class AIAgent:
             
         return cleaned
 
+    @staticmethod
+    def _extract_api_error_context(error: Exception) -> Dict[str, Any]:
+        """Extract structured rate-limit details from provider errors."""
+        context: Dict[str, Any] = {}
+
+        body = getattr(error, "body", None)
+        payload = None
+        if isinstance(body, dict):
+            payload = body.get("error") if isinstance(body.get("error"), dict) else body
+        if isinstance(payload, dict):
+            reason = payload.get("code") or payload.get("error")
+            if isinstance(reason, str) and reason.strip():
+                context["reason"] = reason.strip()
+            message = payload.get("message") or payload.get("error_description")
+            if isinstance(message, str) and message.strip():
+                context["message"] = message.strip()
+            for key in ("resets_at", "reset_at"):
+                value = payload.get(key)
+                if value not in (None, ""):
+                    context["reset_at"] = value
+                    break
+            retry_after = payload.get("retry_after")
+            if retry_after not in (None, "") and "reset_at" not in context:
+                try:
+                    context["reset_at"] = time.time() + float(retry_after)
+                except (TypeError, ValueError):
+                    pass
+
+        response = getattr(error, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers:
+            retry_after = headers.get("retry-after") or headers.get("Retry-After")
+            if retry_after and "reset_at" not in context:
+                try:
+                    context["reset_at"] = time.time() + float(retry_after)
+                except (TypeError, ValueError):
+                    pass
+            ratelimit_reset = headers.get("x-ratelimit-reset")
+            if ratelimit_reset and "reset_at" not in context:
+                context["reset_at"] = ratelimit_reset
+
+        if "message" not in context:
+            raw_message = str(error).strip()
+            if raw_message:
+                context["message"] = raw_message[:500]
+
+        if "reset_at" not in context:
+            message = context.get("message") or ""
+            if isinstance(message, str):
+                delay_match = re.search(r"quotaResetDelay[:\s\"]+(\\d+(?:\\.\\d+)?)(ms|s)", message, re.IGNORECASE)
+                if delay_match:
+                    value = float(delay_match.group(1))
+                    seconds = value / 1000.0 if delay_match.group(2).lower() == "ms" else value
+                    context["reset_at"] = time.time() + seconds
+                else:
+                    sec_match = re.search(
+                        r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)",
+                        message,
+                        re.IGNORECASE,
+                    )
+                    if sec_match:
+                        context["reset_at"] = time.time() + float(sec_match.group(1))
+
+        return context
+
+    def _usage_summary_for_api_request_hook(self, response: Any) -> Optional[Dict[str, Any]]:
+        """Token buckets for ``post_api_request`` plugins (no raw ``response`` object)."""
+        if response is None:
+            return None
+        raw_usage = getattr(response, "usage", None)
+        if not raw_usage:
+            return None
+        from dataclasses import asdict
+
+        cu = normalize_usage(raw_usage, provider=self.provider, api_mode=self.api_mode)
+        summary = asdict(cu)
+        summary.pop("raw_usage", None)
+        summary["prompt_tokens"] = cu.prompt_tokens
+        summary["total_tokens"] = cu.total_tokens
+        return summary
+
     def _dump_api_request_debug(
         self,
         api_kwargs: Dict[str, Any],
@@ -2382,6 +2519,46 @@ class AIAgent:
         self._interrupt_requested = False
         self._interrupt_message = None
         _set_interrupt(False)
+
+    def _touch_activity(self, desc: str) -> None:
+        """Update the last-activity timestamp and description (thread-safe)."""
+        self._last_activity_ts = time.time()
+        self._last_activity_desc = desc
+
+    def get_activity_summary(self) -> dict:
+        """Return a snapshot of the agent's current activity for diagnostics.
+
+        Called by the gateway timeout handler to report what the agent was doing
+        when it was killed, and by the periodic "still working" notifications.
+        """
+        elapsed = time.time() - self._last_activity_ts
+        return {
+            "last_activity_ts": self._last_activity_ts,
+            "last_activity_desc": self._last_activity_desc,
+            "seconds_since_activity": round(elapsed, 1),
+            "current_tool": self._current_tool,
+            "api_call_count": self._api_call_count,
+            "max_iterations": self.max_iterations,
+            "budget_used": self.iteration_budget.used,
+            "budget_max": self.iteration_budget.max_total,
+        }
+
+    def shutdown_memory_provider(self, messages: list = None) -> None:
+        """Shut down the memory provider — call at actual session boundaries.
+
+        This calls on_session_end() then shutdown_all() on the memory
+        manager. NOT called per-turn — only at CLI exit, /reset, gateway
+        session expiry, etc.
+        """
+        if self._memory_manager:
+            try:
+                self._memory_manager.on_session_end(messages or [])
+            except Exception:
+                pass
+            try:
+                self._memory_manager.shutdown_all()
+            except Exception:
+                pass
     
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
@@ -2420,228 +2597,14 @@ class AIAgent:
         """Check if an interrupt has been requested."""
         return self._interrupt_requested
 
-    # ── Honcho integration helpers ──
 
-    def _honcho_should_activate(self, hcfg) -> bool:
-        """Return True when Honcho should be active.
 
-        Self-hosted Honcho may be configured with a base_url and no API key,
-        so activation should accept either credential style.
-        """
-        if not hcfg or not hcfg.enabled:
-            return False
-        if not (hcfg.api_key or hcfg.base_url):
-            return False
-        return True
 
-    def _strip_honcho_tools_from_surface(self) -> None:
-        """Remove Honcho tools from the active tool surface."""
-        if not self.tools:
-            self.valid_tool_names = set()
-            return
 
-        self.tools = [
-            tool for tool in self.tools
-            if tool.get("function", {}).get("name") not in HONCHO_TOOL_NAMES
-        ]
-        self.valid_tool_names = {
-            tool["function"]["name"] for tool in self.tools
-        } if self.tools else set()
 
-    def _activate_honcho(
-        self,
-        hcfg,
-        *,
-        enabled_toolsets: Optional[List[str]],
-        disabled_toolsets: Optional[List[str]],
-        session_db,
-    ) -> None:
-        """Finish Honcho setup once a session manager is available."""
-        if not self._honcho:
-            return
 
-        if not self._honcho_session_key:
-            session_title = None
-            if session_db is not None:
-                try:
-                    session_title = session_db.get_session_title(self.session_id or "")
-                except Exception:
-                    pass
-            self._honcho_session_key = (
-                hcfg.resolve_session_name(
-                    session_title=session_title,
-                    session_id=self.session_id,
-                )
-                or "hermes-default"
-            )
 
-        honcho_sess = self._honcho.get_or_create(self._honcho_session_key)
-        if not honcho_sess.messages:
-            try:
-                from hermes_cli.config import get_hermes_home
 
-                mem_dir = str(get_hermes_home() / "memories")
-                self._honcho.migrate_memory_files(
-                    self._honcho_session_key,
-                    mem_dir,
-                )
-            except Exception as exc:
-                logger.debug("Memory files migration failed (non-fatal): %s", exc)
-
-        from tools.honcho_tools import set_session_context
-
-        set_session_context(self._honcho, self._honcho_session_key)
-
-        # Rebuild tool surface after Honcho context injection. Tool availability
-        # is check_fn-gated and may change once session context is attached.
-        self.tools = get_tool_definitions(
-            enabled_toolsets=enabled_toolsets,
-            disabled_toolsets=disabled_toolsets,
-            quiet_mode=True,
-        )
-        self.valid_tool_names = {
-            tool["function"]["name"] for tool in self.tools
-        } if self.tools else set()
-
-        if hcfg.recall_mode == "context":
-            self._strip_honcho_tools_from_surface()
-            if not self.quiet_mode:
-                print("  Honcho active — recall_mode: context (Honcho tools hidden)")
-        else:
-            if not self.quiet_mode:
-                print(f"  Honcho active — recall_mode: {hcfg.recall_mode}")
-
-        logger.info(
-            "Honcho active (session: %s, user: %s, workspace: %s, "
-            "write_frequency: %s, memory_mode: %s)",
-            self._honcho_session_key,
-            hcfg.peer_name,
-            hcfg.workspace_id,
-            hcfg.write_frequency,
-            hcfg.memory_mode,
-        )
-
-        recall_mode = hcfg.recall_mode
-        if recall_mode != "tools":
-            try:
-                ctx = self._honcho.get_prefetch_context(self._honcho_session_key)
-                if ctx:
-                    self._honcho.set_context_result(self._honcho_session_key, ctx)
-                    logger.debug("Honcho context pre-warmed for first turn")
-            except Exception as exc:
-                logger.debug("Honcho context prefetch failed (non-fatal): %s", exc)
-
-        self._register_honcho_exit_hook()
-
-    def _register_honcho_exit_hook(self) -> None:
-        """Register a process-exit flush hook without clobbering signal handlers."""
-        if self._honcho_exit_hook_registered or not self._honcho:
-            return
-
-        honcho_ref = weakref.ref(self._honcho)
-
-        def _flush_honcho_on_exit():
-            manager = honcho_ref()
-            if manager is None:
-                return
-            try:
-                manager.flush_all()
-            except (Exception, KeyboardInterrupt) as exc:
-                logger.debug("Honcho flush on exit failed (non-fatal): %s", exc)
-
-        atexit.register(_flush_honcho_on_exit)
-        self._honcho_exit_hook_registered = True
-
-    def _queue_honcho_prefetch(self, user_message: str) -> None:
-        """Queue turn-end Honcho prefetch so the next turn can consume cached results."""
-        if not self._honcho or not self._honcho_session_key:
-            return
-
-        recall_mode = (self._honcho_config.recall_mode if self._honcho_config else "hybrid")
-        if recall_mode == "tools":
-            return
-
-        try:
-            self._honcho.prefetch_context(self._honcho_session_key, user_message)
-            self._honcho.prefetch_dialectic(self._honcho_session_key, user_message or "What were we working on?")
-        except Exception as exc:
-            logger.debug("Honcho background prefetch failed (non-fatal): %s", exc)
-
-    def _honcho_prefetch(self, user_message: str) -> str:
-        """Assemble the first-turn Honcho context from the pre-warmed cache."""
-        if not self._honcho or not self._honcho_session_key:
-            return ""
-        try:
-            parts = []
-
-            ctx = self._honcho.pop_context_result(self._honcho_session_key)
-            if ctx:
-                rep = ctx.get("representation", "")
-                card = ctx.get("card", "")
-                if rep:
-                    parts.append(f"## User representation\n{rep}")
-                if card:
-                    parts.append(card)
-                ai_rep = ctx.get("ai_representation", "")
-                ai_card = ctx.get("ai_card", "")
-                if ai_rep:
-                    parts.append(f"## AI peer representation\n{ai_rep}")
-                if ai_card:
-                    parts.append(ai_card)
-
-            dialectic = self._honcho.pop_dialectic_result(self._honcho_session_key)
-            if dialectic:
-                parts.append(f"## Continuity synthesis\n{dialectic}")
-
-            if not parts:
-                return ""
-            header = (
-                "# Honcho Memory (persistent cross-session context)\n"
-                "Use this to answer questions about the user, prior sessions, "
-                "and what you were working on together. Do not call tools to "
-                "look up information that is already present here.\n"
-            )
-            return header + "\n\n".join(parts)
-        except Exception as e:
-            logger.debug("Honcho prefetch failed (non-fatal): %s", e)
-            return ""
-
-    def _honcho_save_user_observation(self, content: str) -> str:
-        """Route a memory tool target=user add to Honcho.
-
-        Sends the content as a user peer message so Honcho's reasoning
-        model can incorporate it into the user representation.
-        """
-        if not content or not content.strip():
-            return json.dumps({"success": False, "error": "Content cannot be empty."})
-        try:
-            session = self._honcho.get_or_create(self._honcho_session_key)
-            session.add_message("user", f"[observation] {content.strip()}")
-            self._honcho.save(session)
-            return json.dumps({
-                "success": True,
-                "target": "user",
-                "message": "Saved to Honcho user model.",
-            })
-        except Exception as e:
-            logger.debug("Honcho user observation failed: %s", e)
-            return json.dumps({"success": False, "error": f"Honcho save failed: {e}"})
-
-    def _honcho_sync(self, user_content: str, assistant_content: str) -> None:
-        """Sync the user/assistant message pair to Honcho."""
-        if not self._honcho or not self._honcho_session_key:
-            return
-        try:
-            session = self._honcho.get_or_create(self._honcho_session_key)
-            session.add_message("user", user_content)
-            session.add_message("assistant", assistant_content)
-            self._honcho.save(session)
-            logger.info("Honcho sync queued for session %s (%d messages)",
-                        self._honcho_session_key, len(session.messages))
-        except Exception as e:
-            logger.warning("Honcho sync failed: %s", e)
-            if not self.quiet_mode:
-                print(f"  Honcho write failed: {e}")
 
     def _build_system_prompt(self, system_message: str = None) -> str:
         """
@@ -2670,20 +2633,7 @@ class AIAgent:
 
         if not _soul_loaded:
             # Fallback to hardcoded identity
-            _ai_peer_name = (
-                self._honcho_config.ai_peer
-                if self._honcho_config and self._honcho_config.ai_peer != "hermes"
-                else None
-            )
-            if _ai_peer_name:
-                _identity = DEFAULT_AGENT_IDENTITY.replace(
-                    "You are Hermes Agent",
-                    f"You are {_ai_peer_name}",
-                    1,
-                )
-            else:
-                _identity = DEFAULT_AGENT_IDENTITY
-            prompt_parts = [_identity]
+            prompt_parts = [DEFAULT_AGENT_IDENTITY]
 
         # Tool-aware behavioral guidance: only inject when the tools are loaded
         tool_guidance = []
@@ -2722,65 +2672,17 @@ class AIAgent:
                 _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
             if _inject:
                 prompt_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
+                _model_lower = (self.model or "").lower()
                 # Google model operational guidance (conciseness, absolute
                 # paths, parallel tool calls, verify-before-edit, etc.)
-                _model_lower = (self.model or "").lower()
                 if "gemini" in _model_lower or "gemma" in _model_lower:
                     prompt_parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
+                # OpenAI GPT/Codex execution discipline (tool persistence,
+                # prerequisite checks, verification, anti-hallucination).
+                if "gpt" in _model_lower or "codex" in _model_lower:
+                    prompt_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
-        # Honcho CLI awareness: tell Hermes about its own management commands
         # so it can refer the user to them rather than reinventing answers.
-        if self._honcho and self._honcho_session_key:
-            hcfg = self._honcho_config
-            mode = hcfg.memory_mode if hcfg else "hybrid"
-            freq = hcfg.write_frequency if hcfg else "async"
-            recall_mode = hcfg.recall_mode if hcfg else "hybrid"
-            honcho_block = (
-                "# Honcho memory integration\n"
-                f"Active. Session: {self._honcho_session_key}. "
-                f"Mode: {mode}. Write frequency: {freq}. Recall: {recall_mode}.\n"
-            )
-            if recall_mode == "context":
-                honcho_block += (
-                    "Honcho context is injected into this system prompt below. "
-                    "All memory retrieval comes from this context — no Honcho tools "
-                    "are available. Answer questions about the user, prior sessions, "
-                    "and recent work directly from the Honcho Memory section.\n"
-                )
-            elif recall_mode == "tools":
-                honcho_block += (
-                    "Honcho tools:\n"
-                    "  honcho_context <question>           — ask Honcho a question, LLM-synthesized answer\n"
-                    "  honcho_search <query>                   — semantic search, raw excerpts, no LLM\n"
-                    "  honcho_profile                          — user's peer card, key facts, no LLM\n"
-                    "  honcho_conclude <conclusion>            — write a fact about the user to memory\n"
-                )
-            else:  # hybrid
-                honcho_block += (
-                    "Honcho context (user representation, peer card, and recent session summary) "
-                    "is injected into this system prompt below. Use it to answer continuity "
-                    "questions ('where were we?', 'what were we working on?') WITHOUT calling "
-                    "any tools. Only call Honcho tools when you need information beyond what is "
-                    "already present in the Honcho Memory section.\n"
-                    "Honcho tools:\n"
-                    "  honcho_context <question>           — ask Honcho a question, LLM-synthesized answer\n"
-                    "  honcho_search <query>                   — semantic search, raw excerpts, no LLM\n"
-                    "  honcho_profile                          — user's peer card, key facts, no LLM\n"
-                    "  honcho_conclude <conclusion>            — write a fact about the user to memory\n"
-                )
-            honcho_block += (
-                "Management commands (refer users here instead of explaining manually):\n"
-                "  hermes honcho status                    — show full config + connection\n"
-                "  hermes honcho mode [hybrid|honcho]       — show or set memory mode\n"
-                "  hermes honcho tokens [--context N] [--dialectic N] — show or set token budgets\n"
-                "  hermes honcho peer [--user NAME] [--ai NAME] [--reasoning LEVEL]\n"
-                "  hermes honcho sessions                  — list directory→session mappings\n"
-                "  hermes honcho map <name>                — map cwd to a session name\n"
-                "  hermes honcho identity [<file>] [--show] — seed or show AI peer identity\n"
-                "  hermes honcho migrate                   — migration guide from openclaw-honcho\n"
-                "  hermes honcho setup                     — full interactive wizard"
-            )
-            prompt_parts.append(honcho_block)
 
         # Note: ephemeral_system_prompt is NOT included here. It's injected at
         # API-call time only so it stays out of the cached/stored system prompt.
@@ -2792,11 +2694,20 @@ class AIAgent:
                 mem_block = self._memory_store.format_for_system_prompt("memory")
                 if mem_block:
                     prompt_parts.append(mem_block)
-            # USER.md is always included when enabled -- Honcho prefetch is additive.
+            # USER.md is always included when enabled.
             if self._user_profile_enabled:
                 user_block = self._memory_store.format_for_system_prompt("user")
                 if user_block:
                     prompt_parts.append(user_block)
+
+        # External memory provider system prompt block (additive to built-in)
+        if self._memory_manager:
+            try:
+                _ext_mem_block = self._memory_manager.build_system_prompt()
+                if _ext_mem_block:
+                    prompt_parts.append(_ext_mem_block)
+            except Exception:
+                pass
 
         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
         if has_skills_tools:
@@ -2867,6 +2778,8 @@ class AIAgent:
             return tc.get("id", "") or ""
         return getattr(tc, "id", "") or ""
 
+    _VALID_API_ROLES = frozenset({"system", "user", "assistant", "tool", "function", "developer"})
+
     @staticmethod
     def _sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Fix orphaned tool_call / tool_result pairs before every LLM call.
@@ -2875,6 +2788,19 @@ class AIAgent:
         is present — so orphans from session loading or manual message
         manipulation are always caught.
         """
+        # --- Role allowlist: drop messages with roles the API won't accept ---
+        filtered = []
+        for msg in messages:
+            role = msg.get("role")
+            if role not in AIAgent._VALID_API_ROLES:
+                logger.debug(
+                    "Pre-call sanitizer: dropping message with invalid role %r",
+                    role,
+                )
+                continue
+            filtered.append(msg)
+        messages = filtered
+
         surviving_call_ids: set = set()
         for msg in messages:
             if msg.get("role") == "assistant":
@@ -3392,7 +3318,7 @@ class AIAgent:
         elif "stream" in api_kwargs:
             raise ValueError("Codex Responses stream flag is only allowed in fallback streaming requests.")
 
-        unexpected = sorted(key for key in api_kwargs.keys() if key not in allowed_keys)
+        unexpected = sorted(key for key in api_kwargs if key not in allowed_keys)
         if unexpected:
             raise ValueError(
                 f"Codex Responses request has unsupported field(s): {', '.join(unexpected)}."
@@ -3436,7 +3362,22 @@ class AIAgent:
         """Normalize a Responses API object to an assistant_message-like object."""
         output = getattr(response, "output", None)
         if not isinstance(output, list) or not output:
-            raise RuntimeError("Responses API returned no output items")
+            # The Codex backend can return empty output when the answer was
+            # delivered entirely via stream events. Check output_text as a
+            # last-resort fallback before raising.
+            out_text = getattr(response, "output_text", None)
+            if isinstance(out_text, str) and out_text.strip():
+                logger.debug(
+                    "Codex response has empty output but output_text is present (%d chars); "
+                    "synthesizing output item.", len(out_text.strip()),
+                )
+                output = [SimpleNamespace(
+                    type="message", role="assistant", status="completed",
+                    content=[SimpleNamespace(type="output_text", text=out_text.strip())],
+                )]
+                response.output = output
+            else:
+                raise RuntimeError("Responses API returned no output items")
 
         response_status = getattr(response, "status", None)
         if isinstance(response_status, str):
@@ -3860,7 +3801,12 @@ class AIAgent:
         has_tool_calls = False
         first_delta_fired = False
         self._reasoning_deltas_fired = False
+        # Accumulate streamed text so we can recover if get_final_response()
+        # returns empty output (e.g. chatgpt.com backend-api sends
+        # response.incomplete instead of response.completed).
+        self._codex_streamed_text_parts: list = []
         for attempt in range(max_stream_retries + 1):
+            collected_output_items: list = []
             try:
                 with active_client.responses.stream(**api_kwargs) as stream:
                     for event in stream:
@@ -3870,6 +3816,8 @@ class AIAgent:
                         # Fire callbacks on text content deltas (suppress during tool calls)
                         if "output_text.delta" in event_type or event_type == "response.output_text.delta":
                             delta_text = getattr(event, "delta", "")
+                            if delta_text:
+                                self._codex_streamed_text_parts.append(delta_text)
                             if delta_text and not has_tool_calls:
                                 if not first_delta_fired:
                                     first_delta_fired = True
@@ -3887,7 +3835,51 @@ class AIAgent:
                             reasoning_text = getattr(event, "delta", "")
                             if reasoning_text:
                                 self._fire_reasoning_delta(reasoning_text)
-                    return stream.get_final_response()
+                        # Collect completed output items — some backends
+                        # (chatgpt.com/backend-api/codex) stream valid items
+                        # via response.output_item.done but the SDK's
+                        # get_final_response() returns an empty output list.
+                        elif event_type == "response.output_item.done":
+                            done_item = getattr(event, "item", None)
+                            if done_item is not None:
+                                collected_output_items.append(done_item)
+                        # Log non-completed terminal events for diagnostics
+                        elif event_type in ("response.incomplete", "response.failed"):
+                            resp_obj = getattr(event, "response", None)
+                            status = getattr(resp_obj, "status", None) if resp_obj else None
+                            incomplete_details = getattr(resp_obj, "incomplete_details", None) if resp_obj else None
+                            logger.warning(
+                                "Codex Responses stream received terminal event %s "
+                                "(status=%s, incomplete_details=%s, streamed_chars=%d). %s",
+                                event_type, status, incomplete_details,
+                                sum(len(p) for p in self._codex_streamed_text_parts),
+                                self._client_log_context(),
+                            )
+                    final_response = stream.get_final_response()
+                    # PATCH: ChatGPT Codex backend streams valid output items
+                    # but get_final_response() can return an empty output list.
+                    # Backfill from collected items or synthesize from deltas.
+                    _out = getattr(final_response, "output", None)
+                    if isinstance(_out, list) and not _out:
+                        if collected_output_items:
+                            final_response.output = list(collected_output_items)
+                            logger.debug(
+                                "Codex stream: backfilled %d output items from stream events",
+                                len(collected_output_items),
+                            )
+                        elif self._codex_streamed_text_parts and not has_tool_calls:
+                            assembled = "".join(self._codex_streamed_text_parts)
+                            final_response.output = [SimpleNamespace(
+                                type="message",
+                                role="assistant",
+                                status="completed",
+                                content=[SimpleNamespace(type="output_text", text=assembled)],
+                            )]
+                            logger.debug(
+                                "Codex stream: synthesized output from %d text deltas (%d chars)",
+                                len(self._codex_streamed_text_parts), len(assembled),
+                            )
+                    return final_response
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
                     logger.debug(
@@ -3938,11 +3930,28 @@ class AIAgent:
             return stream_or_response
 
         terminal_response = None
+        collected_output_items: list = []
+        collected_text_deltas: list = []
         try:
             for event in stream_or_response:
                 event_type = getattr(event, "type", None)
                 if not event_type and isinstance(event, dict):
                     event_type = event.get("type")
+
+                # Collect output items and text deltas for backfill
+                if event_type == "response.output_item.done":
+                    done_item = getattr(event, "item", None)
+                    if done_item is None and isinstance(event, dict):
+                        done_item = event.get("item")
+                    if done_item is not None:
+                        collected_output_items.append(done_item)
+                elif event_type in ("response.output_text.delta",):
+                    delta = getattr(event, "delta", "")
+                    if not delta and isinstance(event, dict):
+                        delta = event.get("delta", "")
+                    if delta:
+                        collected_text_deltas.append(delta)
+
                 if event_type not in {"response.completed", "response.incomplete", "response.failed"}:
                     continue
 
@@ -3950,6 +3959,26 @@ class AIAgent:
                 if terminal_response is None and isinstance(event, dict):
                     terminal_response = event.get("response")
                 if terminal_response is not None:
+                    # Backfill empty output from collected stream events
+                    _out = getattr(terminal_response, "output", None)
+                    if isinstance(_out, list) and not _out:
+                        if collected_output_items:
+                            terminal_response.output = list(collected_output_items)
+                            logger.debug(
+                                "Codex fallback stream: backfilled %d output items",
+                                len(collected_output_items),
+                            )
+                        elif collected_text_deltas:
+                            assembled = "".join(collected_text_deltas)
+                            terminal_response.output = [SimpleNamespace(
+                                type="message", role="assistant",
+                                status="completed",
+                                content=[SimpleNamespace(type="output_text", text=assembled)],
+                            )]
+                            logger.debug(
+                                "Codex fallback stream: synthesized from %d deltas (%d chars)",
+                                len(collected_text_deltas), len(assembled),
+                            )
                     return terminal_response
         finally:
             close_fn = getattr(stream_or_response, "close", None)
@@ -4113,6 +4142,7 @@ class AIAgent:
         *,
         status_code: Optional[int],
         has_retried_429: bool,
+        error_context: Optional[Dict[str, Any]] = None,
     ) -> tuple[bool, bool]:
         """Attempt credential recovery via pool rotation.
 
@@ -4127,7 +4157,7 @@ class AIAgent:
             return False, has_retried_429
 
         if status_code == 402:
-            next_entry = pool.mark_exhausted_and_rotate(status_code=402)
+            next_entry = pool.mark_exhausted_and_rotate(status_code=402, error_context=error_context)
             if next_entry is not None:
                 logger.info(f"Credential 402 (billing) — rotated to pool entry {getattr(next_entry, 'id', '?')}")
                 self._swap_credential(next_entry)
@@ -4137,7 +4167,7 @@ class AIAgent:
         if status_code == 429:
             if not has_retried_429:
                 return False, True
-            next_entry = pool.mark_exhausted_and_rotate(status_code=429)
+            next_entry = pool.mark_exhausted_and_rotate(status_code=429, error_context=error_context)
             if next_entry is not None:
                 logger.info(f"Credential 429 (rate limit) — rotated to pool entry {getattr(next_entry, 'id', '?')}")
                 self._swap_credential(next_entry)
@@ -4152,7 +4182,7 @@ class AIAgent:
                 return True, has_retried_429
             # Refresh failed — rotate to next credential instead of giving up.
             # The failed entry is already marked exhausted by try_refresh_current().
-            next_entry = pool.mark_exhausted_and_rotate(status_code=401)
+            next_entry = pool.mark_exhausted_and_rotate(status_code=401, error_context=error_context)
             if next_entry is not None:
                 logger.info(f"Credential 401 (refresh failed) — rotated to pool entry {getattr(next_entry, 'id', '?')}")
                 self._swap_credential(next_entry)
@@ -4344,6 +4374,7 @@ class AIAgent:
             # Reset stale-stream timer so the detector measures from this
             # attempt's start, not a previous attempt's last chunk.
             last_chunk_time["t"] = time.time()
+            self._touch_activity("waiting for provider response (streaming)")
             stream = request_client_holder["client"].chat.completions.create(**stream_kwargs)
 
             content_parts: list = []
@@ -4364,8 +4395,12 @@ class AIAgent:
             # knows whether reasoning was already displayed during streaming.
             self._reasoning_deltas_fired = False
 
+            _first_chunk_seen = False
             for chunk in stream:
                 last_chunk_time["t"] = time.time()
+                if not _first_chunk_seen:
+                    _first_chunk_seen = True
+                    self._touch_activity("receiving stream response")
 
                 if self._interrupt_requested:
                     break
@@ -4716,10 +4751,20 @@ class AIAgent:
             # Detect stale streams: connections kept alive by SSE pings
             # but delivering no real chunks.  Kill the client so the
             # inner retry loop can start a fresh connection.
-            if time.time() - last_chunk_time["t"] > _stream_stale_timeout:
+            _stale_elapsed = time.time() - last_chunk_time["t"]
+            if _stale_elapsed > _stream_stale_timeout:
+                _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
                 logger.warning(
-                    "Stream stale for %.0fs — no chunks received. Killing connection.",
-                    _stream_stale_timeout,
+                    "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
+                    "model=%s context=~%s tokens. Killing connection.",
+                    _stale_elapsed, _stream_stale_timeout,
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+                )
+                self._emit_status(
+                    f"⚠️ No response from provider for {int(_stale_elapsed)}s "
+                    f"(model: {api_kwargs.get('model', 'unknown')}, "
+                    f"context: ~{_est_ctx:,} tokens). "
+                    f"Reconnecting..."
                 )
                 try:
                     rc = request_client_holder.get("client")
@@ -4755,6 +4800,29 @@ class AIAgent:
                     pass
                 raise InterruptedError("Agent interrupted during streaming API call")
         if result["error"] is not None:
+            if deltas_were_sent["yes"]:
+                # Streaming failed AFTER some tokens were already delivered to
+                # the platform.  Re-raising would let the outer retry loop make
+                # a new API call, creating a duplicate message.  Return a
+                # partial "stop" response instead so the outer loop treats this
+                # turn as complete (no retry, no fallback).
+                logger.warning(
+                    "Partial stream delivered before error; returning stub "
+                    "response to prevent duplicate messages: %s",
+                    result["error"],
+                )
+                _stub_msg = SimpleNamespace(
+                    role="assistant", content=None, tool_calls=None,
+                    reasoning_content=None,
+                )
+                return SimpleNamespace(
+                    id="partial-stream-stub",
+                    model=getattr(self, "model", "unknown"),
+                    choices=[SimpleNamespace(
+                        index=0, message=_stub_msg, finish_reason="stop",
+                    )],
+                    usage=None,
+                )
             raise result["error"]
         return result["response"]
 
@@ -4787,8 +4855,19 @@ class AIAgent:
         # access for Codex providers.
         try:
             from agent.auxiliary_client import resolve_provider_client
+            # Pass base_url and api_key from fallback config so custom
+            # endpoints (e.g. Ollama Cloud) resolve correctly instead of
+            # falling through to OpenRouter defaults.
+            fb_base_url_hint = (fb.get("base_url") or "").strip() or None
+            fb_api_key_hint = (fb.get("api_key") or "").strip() or None
+            # For Ollama Cloud endpoints, pull OLLAMA_API_KEY from env
+            # when no explicit key is in the fallback config.
+            if fb_base_url_hint and "ollama.com" in fb_base_url_hint.lower() and not fb_api_key_hint:
+                fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
             fb_client, _ = resolve_provider_client(
-                fb_provider, model=fb_model, raw_codex=True)
+                fb_provider, model=fb_model, raw_codex=True,
+                explicit_base_url=fb_base_url_hint,
+                explicit_api_key=fb_api_key_hint)
             if fb_client is None:
                 logging.warning(
                     "Fallback to %s failed: provider not configured",
@@ -5166,11 +5245,13 @@ class AIAgent:
         return transformed
 
     def _anthropic_preserve_dots(self) -> bool:
-        """True when using Alibaba/DashScope anthropic-compatible endpoint (model names keep dots, e.g. qwen3.5-plus)."""
-        if (getattr(self, "provider", "") or "").lower() == "alibaba":
+        """True when using an anthropic-compatible endpoint that preserves dots in model names.
+        Alibaba/DashScope keeps dots (e.g. qwen3.5-plus).
+        OpenCode Go keeps dots (e.g. minimax-m2.7)."""
+        if (getattr(self, "provider", "") or "").lower() in {"alibaba", "opencode-go"}:
             return True
         base = (getattr(self, "base_url", "") or "").lower()
-        return "dashscope" in base or "aliyuncs" in base
+        return "dashscope" in base or "aliyuncs" in base or "opencode.ai/zen/go" in base
 
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
@@ -5378,6 +5459,12 @@ class AIAgent:
         if extra_body:
             api_kwargs["extra_body"] = extra_body
 
+        # xAI prompt caching: send x-grok-conv-id header to route requests
+        # to the same server, maximizing automatic cache hits.
+        # https://docs.x.ai/developers/advanced-api-usage/prompt-caching
+        if "x.ai" in self._base_url_lower and hasattr(self, "session_id") and self.session_id:
+            api_kwargs["extra_headers"] = {"x-grok-conv-id": self.session_id}
+
         return api_kwargs
 
     def _supports_reasoning_extra_body(self) -> bool:
@@ -5568,15 +5655,18 @@ class AIAgent:
     def _sanitize_tool_calls_for_strict_api(api_msg: dict) -> dict:
         """Strip Codex Responses API fields from tool_calls for strict providers.
 
-        Providers like Mistral strictly validate the Chat Completions schema
-        and reject unknown fields (call_id, response_item_id) with 422.
-        These fields are preserved in the internal message history — this
-        method only modifies the outgoing API copy.
+        Providers like Mistral, Fireworks, and other strict OpenAI-compatible APIs
+        validate the Chat Completions schema and reject unknown fields (call_id,
+        response_item_id) with 400 or 422 errors. These fields are preserved in
+        the internal message history — this method only modifies the outgoing
+        API copy.
 
         Creates new tool_call dicts rather than mutating in-place, so the
         original messages list retains call_id/response_item_id for Codex
         Responses API compatibility (e.g. if the session falls back to a
         Codex provider later).
+
+        Fields stripped: call_id, response_item_id
         """
         tool_calls = api_msg.get("tool_calls")
         if not isinstance(tool_calls, list):
@@ -5588,6 +5678,19 @@ class AIAgent:
             for tc in tool_calls
         ]
         return api_msg
+
+    def _should_sanitize_tool_calls(self) -> bool:
+        """Determine if tool_calls need sanitization for strict APIs.
+
+        Codex Responses API uses fields like call_id and response_item_id
+        that are not part of the standard Chat Completions schema. These
+        fields must be stripped when calling any other API to avoid
+        validation errors (400 Bad Request).
+
+        Returns:
+            bool: True if sanitization is needed (non-Codex API), False otherwise.
+        """
+        return self.api_mode != "codex_responses"
 
     def flush_memories(self, messages: list = None, min_turns: int = None):
         """Give the model one turn to persist memories before context is lost.
@@ -5606,10 +5709,6 @@ class AIAgent:
         if self._memory_flush_min_turns == 0 and min_turns is None:
             return
         if "memory" not in self.valid_tool_names or not self._memory_store:
-            return
-        # honcho-only agent mode: skip local MEMORY.md flush
-        _hcfg = getattr(self, '_honcho_config', None)
-        if _hcfg and _hcfg.peer_memory_mode(_hcfg.ai_peer) == "honcho":
             return
         effective_min = min_turns if min_turns is not None else self._memory_flush_min_turns
         if self._user_turn_count < effective_min:
@@ -5631,7 +5730,7 @@ class AIAgent:
 
         try:
             # Build API messages for the flush call
-            _is_strict_api = "api.mistral.ai" in self._base_url_lower
+            _needs_sanitize = self._should_sanitize_tool_calls()
             api_messages = []
             for msg in messages:
                 api_msg = msg.copy()
@@ -5642,7 +5741,7 @@ class AIAgent:
                 api_msg.pop("reasoning", None)
                 api_msg.pop("finish_reason", None)
                 api_msg.pop("_flush_sentinel", None)
-                if _is_strict_api:
+                if _needs_sanitize:
                     self._sanitize_tool_calls_for_strict_api(api_msg)
                 api_messages.append(api_msg)
 
@@ -5727,15 +5826,13 @@ class AIAgent:
                         args = json.loads(tc.function.arguments)
                         flush_target = args.get("target", "memory")
                         from tools.memory_tool import memory_tool as _memory_tool
-                        result = _memory_tool(
+                        _memory_tool(
                             action=args.get("action"),
                             target=flush_target,
                             content=args.get("content"),
                             old_text=args.get("old_text"),
                             store=self._memory_store,
                         )
-                        if self._honcho and flush_target == "user" and args.get("action") == "add":
-                            self._honcho_save_user_observation(args.get("content", ""))
                         if not self.quiet_mode:
                             print(f"  🧠 Memory flush: saved to {args.get('target', 'memory')}")
                     except Exception as e:
@@ -5758,8 +5855,21 @@ class AIAgent:
         Returns:
             (compressed_messages, new_system_prompt) tuple
         """
+        _pre_msg_count = len(messages)
+        logger.info(
+            "context compression started: session=%s messages=%d tokens=~%s model=%s",
+            self.session_id or "none", _pre_msg_count,
+            f"{approx_tokens:,}" if approx_tokens else "unknown", self.model,
+        )
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
+
+        # Notify external memory provider before compression discards context
+        if self._memory_manager:
+            try:
+                self._memory_manager.on_pre_compress(messages)
+            except Exception:
+                pass
 
         compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
 
@@ -5827,6 +5937,11 @@ class AIAgent:
         except Exception:
             pass
 
+        logger.info(
+            "context compression done: session=%s messages=%d->%d tokens=~%s",
+            self.session_id or "none", _pre_msg_count, len(compressed),
+            f"{_compressed_est:,}",
+        )
         return compressed, new_system_prompt
 
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
@@ -5852,7 +5967,8 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
-    def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str) -> str:
+    def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
+                     tool_call_id: Optional[str] = None) -> str:
         """Invoke a single tool and return the result string. No display logic.
 
         Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
@@ -5887,10 +6003,19 @@ class AIAgent:
                 old_text=function_args.get("old_text"),
                 store=self._memory_store,
             )
-            # Also send user observations to Honcho when active
-            if self._honcho and target == "user" and function_args.get("action") == "add":
-                self._honcho_save_user_observation(function_args.get("content", ""))
+            # Bridge: notify external memory provider of built-in memory writes
+            if self._memory_manager and function_args.get("action") in ("add", "replace"):
+                try:
+                    self._memory_manager.on_memory_write(
+                        function_args.get("action", ""),
+                        target,
+                        function_args.get("content", ""),
+                    )
+                except Exception:
+                    pass
             return result
+        elif self._memory_manager and self._memory_manager.has_tool(function_name):
+            return self._memory_manager.handle_tool_call(function_name, function_args)
         elif function_name == "clarify":
             from tools.clarify_tool import clarify_tool as _clarify_tool
             return _clarify_tool(
@@ -5911,9 +6036,9 @@ class AIAgent:
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
+                tool_call_id=tool_call_id,
+                session_id=self.session_id or "",
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
-                honcho_manager=self._honcho,
-                honcho_session_key=self._honcho_session_key,
             )
 
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
@@ -5995,7 +6120,7 @@ class AIAgent:
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(name, args)
-                    self.tool_progress_callback(name, preview, args)
+                    self.tool_progress_callback("tool.started", name, preview, args)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -6014,17 +6139,21 @@ class AIAgent:
             """Worker function executed in a thread."""
             start = time.time()
             try:
-                result = self._invoke_tool(function_name, function_args, effective_task_id)
+                result = self._invoke_tool(function_name, function_args, effective_task_id, tool_call.id)
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
+            if is_error:
+                logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
+            else:
+                logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
             results[index] = (function_name, function_args, result, duration, is_error)
 
         # Start spinner for CLI mode (skip when TUI handles tool progress)
         spinner = None
-        if self.quiet_mode and not self.tool_progress_callback:
+        if self.quiet_mode and not self.tool_progress_callback and self._should_start_quiet_spinner():
             face = random.choice(KawaiiSpinner.KAWAII_WAITING)
             spinner = KawaiiSpinner(f"{face} ⚡ running {num_tools} tools concurrently", spinner_type='dots', print_fn=self._print_fn)
             spinner.start()
@@ -6060,6 +6189,15 @@ class AIAgent:
                     result_preview = function_result[:200] if len(function_result) > 200 else function_result
                     logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
 
+                if self.tool_progress_callback:
+                    try:
+                        self.tool_progress_callback(
+                            "tool.completed", function_name, None, None,
+                            duration=tool_duration, is_error=is_error,
+                        )
+                    except Exception as cb_err:
+                        logging.debug(f"Tool progress callback error: {cb_err}")
+
                 if self.verbose_logging:
                     logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                     logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
@@ -6076,21 +6214,22 @@ class AIAgent:
                     response_preview = function_result[:self.log_prefix_chars] + "..." if len(function_result) > self.log_prefix_chars else function_result
                     print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
 
+            self._current_tool = None
+            self._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s)")
+
             if self.tool_complete_callback:
                 try:
                     self.tool_complete_callback(tc.id, name, args, function_result)
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
 
-            # Truncate oversized results
-            MAX_TOOL_RESULT_CHARS = 100_000
-            if len(function_result) > MAX_TOOL_RESULT_CHARS:
-                original_len = len(function_result)
-                function_result = (
-                    function_result[:MAX_TOOL_RESULT_CHARS]
-                    + f"\n\n[Truncated: tool response was {original_len:,} chars, "
-                    f"exceeding the {MAX_TOOL_RESULT_CHARS:,} char limit]"
-                )
+            # Save oversized results to file instead of destructive truncation
+            function_result = _save_oversized_tool_result(name, function_result)
+
+            # Discover subdirectory context files from tool arguments
+            subdir_hints = self._subdirectory_hints.check_tool_call(name, args)
+            if subdir_hints:
+                function_result += subdir_hints
 
             # Append tool result message in order
             tool_msg = {
@@ -6163,10 +6302,13 @@ class AIAgent:
                     args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
                     print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())}) - {args_preview}")
 
+            self._current_tool = function_name
+            self._touch_activity(f"executing tool: {function_name}")
+
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(function_name, function_args)
-                    self.tool_progress_callback(function_name, preview, function_args)
+                    self.tool_progress_callback("tool.started", function_name, preview, function_args)
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
@@ -6237,9 +6379,6 @@ class AIAgent:
                     old_text=function_args.get("old_text"),
                     store=self._memory_store,
                 )
-                # Also send user observations to Honcho when active
-                if self._honcho and target == "user" and function_args.get("action") == "add":
-                    self._honcho_save_user_observation(function_args.get("content", ""))
                 tool_duration = time.time() - tool_start_time
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
@@ -6262,7 +6401,7 @@ class AIAgent:
                     goal_preview = (function_args.get("goal") or "")[:30]
                     spinner_label = f"🔀 {goal_preview}" if goal_preview else "🔀 delegating"
                 spinner = None
-                if self.quiet_mode and not self.tool_progress_callback:
+                if self.quiet_mode and not self.tool_progress_callback and self._should_start_quiet_spinner():
                     face = random.choice(KawaiiSpinner.KAWAII_WAITING)
                     spinner = KawaiiSpinner(f"{face} {spinner_label}", spinner_type='dots', print_fn=self._print_fn)
                     spinner.start()
@@ -6286,6 +6425,30 @@ class AIAgent:
                         spinner.stop(cute_msg)
                     elif self.quiet_mode:
                         self._vprint(f"  {cute_msg}")
+            elif self._memory_manager and self._memory_manager.has_tool(function_name):
+                # Memory provider tools (hindsight_retain, honcho_search, etc.)
+                # These are not in the tool registry — route through MemoryManager.
+                spinner = None
+                if self.quiet_mode and not self.tool_progress_callback:
+                    face = random.choice(KawaiiSpinner.KAWAII_WAITING)
+                    emoji = _get_tool_emoji(function_name)
+                    preview = _build_tool_preview(function_name, function_args) or function_name
+                    spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
+                    spinner.start()
+                _mem_result = None
+                try:
+                    function_result = self._memory_manager.handle_tool_call(function_name, function_args)
+                    _mem_result = function_result
+                except Exception as tool_error:
+                    function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
+                    logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
+                finally:
+                    tool_duration = time.time() - tool_start_time
+                    cute_msg = _get_cute_tool_message_impl(function_name, function_args, tool_duration, result=_mem_result)
+                    if spinner:
+                        spinner.stop(cute_msg)
+                    elif self.quiet_mode:
+                        self._vprint(f"  {cute_msg}")
             elif self.quiet_mode:
                 spinner = None
                 if not self.tool_progress_callback:
@@ -6298,9 +6461,9 @@ class AIAgent:
                 try:
                     function_result = handle_function_call(
                         function_name, function_args, effective_task_id,
+                        tool_call_id=tool_call.id,
+                        session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
-                        honcho_manager=self._honcho,
-                        honcho_session_key=self._honcho_session_key,
                     )
                     _spinner_result = function_result
                 except Exception as tool_error:
@@ -6317,9 +6480,9 @@ class AIAgent:
                 try:
                     function_result = handle_function_call(
                         function_name, function_args, effective_task_id,
+                        tool_call_id=tool_call.id,
+                        session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
-                        honcho_manager=self._honcho,
-                        honcho_session_key=self._honcho_session_key,
                     )
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
@@ -6335,6 +6498,20 @@ class AIAgent:
             _is_error_result, _ = _detect_tool_failure(function_name, function_result)
             if _is_error_result:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+            else:
+                logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, len(function_result))
+
+            if self.tool_progress_callback:
+                try:
+                    self.tool_progress_callback(
+                        "tool.completed", function_name, None, None,
+                        duration=tool_duration, is_error=_is_error_result,
+                    )
+                except Exception as cb_err:
+                    logging.debug(f"Tool progress callback error: {cb_err}")
+
+            self._current_tool = None
+            self._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
 
             if self.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
@@ -6346,18 +6523,13 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool complete callback error: {cb_err}")
 
-            # Guard against tools returning absurdly large content that would
-            # blow up the context window. 100K chars ≈ 25K tokens — generous
-            # enough for any reasonable tool output but prevents catastrophic
-            # context explosions (e.g. accidental base64 image dumps).
-            MAX_TOOL_RESULT_CHARS = 100_000
-            if len(function_result) > MAX_TOOL_RESULT_CHARS:
-                original_len = len(function_result)
-                function_result = (
-                    function_result[:MAX_TOOL_RESULT_CHARS]
-                    + f"\n\n[Truncated: tool response was {original_len:,} chars, "
-                    f"exceeding the {MAX_TOOL_RESULT_CHARS:,} char limit]"
-                )
+            # Save oversized results to file instead of destructive truncation
+            function_result = _save_oversized_tool_result(function_name, function_result)
+
+            # Discover subdirectory context files from tool arguments
+            subdir_hints = self._subdirectory_hints.check_tool_call(function_name, function_args)
+            if subdir_hints:
+                function_result += subdir_hints
 
             tool_msg = {
                 "role": "tool",
@@ -6488,13 +6660,13 @@ class AIAgent:
         try:
             # Build API messages, stripping internal-only fields
             # (finish_reason, reasoning) that strict APIs like Mistral reject with 422
-            _is_strict_api = "api.mistral.ai" in self._base_url_lower
+            _needs_sanitize = self._should_sanitize_tool_calls()
             api_messages = []
             for msg in messages:
                 api_msg = msg.copy()
                 for internal_field in ("reasoning", "finish_reason"):
                     api_msg.pop(internal_field, None)
-                if _is_strict_api:
+                if _needs_sanitize:
                     self._sanitize_tool_calls_for_strict_api(api_msg)
                 api_messages.append(api_msg)
 
@@ -6633,7 +6805,6 @@ class AIAgent:
         task_id: str = None,
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
-        sync_honcho: bool = True,
     ) -> Dict[str, Any]:
         """
         Run a complete conversation with tool calling until completion.
@@ -6649,8 +6820,7 @@ class AIAgent:
             persist_user_message: Optional clean user message to store in
                 transcripts/history when user_message contains API-only
                 synthetic prefixes.
-            sync_honcho: When False, skip writing the final synthetic turn back
-                to Honcho or queuing follow-up prefetch work.
+                    or queuing follow-up prefetch work.
 
         Returns:
             Dict: Complete conversation result with final response and message history
@@ -6707,7 +6877,17 @@ class AIAgent:
         # They are initialized in __init__ and must persist across run_conversation
         # calls so that nudge logic accumulates correctly in CLI mode.
         self.iteration_budget = IterationBudget(self.max_iterations)
-        
+
+        # Log conversation turn start for debugging/observability
+        _msg_preview = (user_message[:80] + "...") if len(user_message) > 80 else user_message
+        _msg_preview = _msg_preview.replace("\n", " ")
+        logger.info(
+            "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
+            self.session_id or "none", self.model, self.provider or "unknown",
+            self.platform or "unknown", len(conversation_history or []),
+            _msg_preview,
+        )
+
         # Initialize conversation (copy to avoid mutating the caller's list)
         messages = list(conversation_history) if conversation_history else []
 
@@ -6734,7 +6914,6 @@ class AIAgent:
         self._user_turn_count += 1
 
         # Preserve the original user message (no nudge injection).
-        # Honcho should receive the actual user input, not system nudges.
         original_user_message = persist_user_message if persist_user_message is not None else user_message
 
         # Track memory nudge trigger (turn-based, checked here).
@@ -6748,27 +6927,6 @@ class AIAgent:
             if self._turns_since_memory >= self._memory_nudge_interval:
                 _should_review_memory = True
                 self._turns_since_memory = 0
-
-        # Honcho prefetch consumption:
-        # - First turn: bake into cached system prompt (stable for the session).
-        # - Later turns: attach recall to the current-turn user message at
-        #   API-call time only (never persisted to history / session DB).
-        #
-        # This keeps the system-prefix cache stable while still allowing turn N
-        # to consume background prefetch results from turn N-1.
-        self._honcho_context = ""
-        self._honcho_turn_context = ""
-        _recall_mode = (self._honcho_config.recall_mode if self._honcho_config else "hybrid")
-        if self._honcho and self._honcho_session_key and _recall_mode != "tools":
-            try:
-                prefetched_context = self._honcho_prefetch(original_user_message)
-                if prefetched_context:
-                    if not conversation_history:
-                        self._honcho_context = prefetched_context
-                    else:
-                        self._honcho_turn_context = prefetched_context
-            except Exception as e:
-                logger.debug("Honcho prefetch failed (non-fatal): %s", e)
 
         # Add user message
         user_msg = {"role": "user", "content": user_message}
@@ -6807,13 +6965,6 @@ class AIAgent:
             else:
                 # First turn of a new session — build from scratch.
                 self._cached_system_prompt = self._build_system_prompt(system_message)
-                # Bake Honcho context into the prompt so it's stable for
-                # the entire session (not re-fetched per turn).
-                if self._honcho_context:
-                    self._cached_system_prompt = (
-                        self._cached_system_prompt + "\n\n" + self._honcho_context
-                    ).strip()
-
                 # Plugin hook: on_session_start
                 # Fired once when a brand-new session is created (not on
                 # continuation).  Plugins can use this to initialise
@@ -6898,10 +7049,17 @@ class AIAgent:
 
         # Plugin hook: pre_llm_call
         # Fired once per turn before the tool-calling loop.  Plugins can
-        # return a dict with a ``context`` key whose value is a string
-        # that will be appended to the ephemeral system prompt for every
-        # API call in this turn (not persisted to session DB or cache).
-        _plugin_turn_context = ""
+        # return a dict with a ``context`` key (or a plain string) whose
+        # value is appended to the current turn's user message.
+        #
+        # Context is ALWAYS injected into the user message, never the
+        # system prompt.  This preserves the prompt cache prefix — the
+        # system prompt stays identical across turns so cached tokens
+        # are reused.  The system prompt is Hermes's territory; plugins
+        # contribute context alongside the user's input.
+        #
+        # All injected context is ephemeral (not persisted to session DB).
+        _plugin_user_context = ""
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _pre_results = _invoke_hook(
@@ -6913,14 +7071,14 @@ class AIAgent:
                 model=self.model,
                 platform=getattr(self, "platform", None) or "",
             )
-            _ctx_parts = []
+            _ctx_parts: list[str] = []
             for r in _pre_results:
                 if isinstance(r, dict) and r.get("context"):
                     _ctx_parts.append(str(r["context"]))
                 elif isinstance(r, str) and r.strip():
                     _ctx_parts.append(r)
             if _ctx_parts:
-                _plugin_turn_context = "\n\n".join(_ctx_parts)
+                _plugin_user_context = "\n\n".join(_ctx_parts)
         except Exception as exc:
             logger.warning("pre_llm_call hook failed: %s", exc)
 
@@ -6935,7 +7093,20 @@ class AIAgent:
         
         # Clear any stale interrupt state at start
         self.clear_interrupt()
-        
+
+        # External memory provider: prefetch once before the tool loop.
+        # Reuse the cached result on every iteration to avoid re-calling
+        # prefetch_all() on each tool call (10 tool calls = 10x latency + cost).
+        # Use original_user_message (clean input) — user_message may contain
+        # injected skill content that bloats / breaks provider queries.
+        _ext_prefetch_cache = ""
+        if self._memory_manager:
+            try:
+                _query = original_user_message if isinstance(original_user_message, str) else ""
+                _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
+            except Exception:
+                pass
+
         while api_call_count < self.max_iterations and self.iteration_budget.remaining > 0:
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
@@ -6948,6 +7119,8 @@ class AIAgent:
                 break
             
             api_call_count += 1
+            self._api_call_count = api_call_count
+            self._touch_activity(f"starting API call #{api_call_count}")
             if not self.iteration_budget.consume():
                 if not self.quiet_mode:
                     self._safe_print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
@@ -6957,10 +7130,21 @@ class AIAgent:
             if self.step_callback is not None:
                 try:
                     prev_tools = []
-                    for _m in reversed(messages):
+                    for _idx, _m in enumerate(reversed(messages)):
                         if _m.get("role") == "assistant" and _m.get("tool_calls"):
+                            _fwd_start = len(messages) - _idx
+                            _results_by_id = {}
+                            for _tm in messages[_fwd_start:]:
+                                if _tm.get("role") != "tool":
+                                    break
+                                _tcid = _tm.get("tool_call_id")
+                                if _tcid:
+                                    _results_by_id[_tcid] = _tm.get("content", "")
                             prev_tools = [
-                                tc["function"]["name"]
+                                {
+                                    "name": tc["function"]["name"],
+                                    "result": _results_by_id.get(tc.get("id")),
+                                }
                                 for tc in _m["tool_calls"]
                                 if isinstance(tc, dict)
                             ]
@@ -6984,10 +7168,23 @@ class AIAgent:
             for idx, msg in enumerate(messages):
                 api_msg = msg.copy()
 
-                if idx == current_turn_user_idx and msg.get("role") == "user" and self._honcho_turn_context:
-                    api_msg["content"] = _inject_honcho_turn_context(
-                        api_msg.get("content", ""), self._honcho_turn_context
-                    )
+                # Inject ephemeral context into the current turn's user message.
+                # Sources: memory manager prefetch + plugin pre_llm_call hooks
+                # with target="user_message" (the default).  Both are
+                # API-call-time only — the original message in `messages` is
+                # never mutated, so nothing leaks into session persistence.
+                if idx == current_turn_user_idx and msg.get("role") == "user":
+                    _injections = []
+                    if _ext_prefetch_cache:
+                        _fenced = build_memory_context_block(_ext_prefetch_cache)
+                        if _fenced:
+                            _injections.append(_fenced)
+                    if _plugin_user_context:
+                        _injections.append(_plugin_user_context)
+                    if _injections:
+                        _base = api_msg.get("content", "")
+                        if isinstance(_base, str):
+                            api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
 
                 # For ALL assistant messages, pass reasoning back to the API
                 # This ensures multi-turn reasoning context is preserved
@@ -7005,10 +7202,10 @@ class AIAgent:
                 if "finish_reason" in api_msg:
                     api_msg.pop("finish_reason")
                 # Strip Codex Responses API fields (call_id, response_item_id) for
-                # strict providers like Mistral that reject unknown fields with 422.
+                # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
                 # Uses new dicts so the internal messages list retains the fields
                 # for Codex Responses compatibility.
-                if "api.mistral.ai" in self._base_url_lower:
+                if self._should_sanitize_tool_calls():
                     self._sanitize_tool_calls_for_strict_api(api_msg)
                 # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
                 # The signature field helps maintain reasoning continuity
@@ -7016,14 +7213,15 @@ class AIAgent:
 
             # Build the final system message: cached prompt + ephemeral system prompt.
             # Ephemeral additions are API-call-time only (not persisted to session DB).
-            # Honcho later-turn recall is intentionally kept OUT of the system prompt
-            # so the stable cache prefix remains unchanged.
+            # External recall context is injected into the user message, not the system
+            # prompt, so the stable cache prefix remains unchanged.
             effective_system = active_system_prompt or ""
             if self.ephemeral_system_prompt:
                 effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
-            # Plugin context from pre_llm_call hooks — ephemeral, not cached.
-            if _plugin_turn_context:
-                effective_system = (effective_system + "\n\n" + _plugin_turn_context).strip()
+            # NOTE: Plugin context from pre_llm_call hooks is injected into the
+            # user message (see injection block above), NOT the system prompt.
+            # This is intentional — system prompt modifications break the prompt
+            # cache prefix.  The system prompt is reserved for Hermes internals.
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
@@ -7066,9 +7264,9 @@ class AIAgent:
                     # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
                     # (works in both streaming and non-streaming modes)
                     self.thinking_callback(f"{face} {verb}...")
-                elif not self._has_stream_consumers():
-                    # Raw KawaiiSpinner only when no streaming consumers
-                    # (would conflict with streamed token output)
+                elif not self._has_stream_consumers() and self._should_start_quiet_spinner():
+                    # Raw KawaiiSpinner only when no streaming consumers and the
+                    # spinner output has a safe sink.
                     spinner_type = random.choice(['brain', 'sparkle', 'pulse', 'moon', 'star'])
                     thinking_spinner = KawaiiSpinner(f"{face} {verb}...", spinner_type=spinner_type, print_fn=self._print_fn)
                     thinking_spinner.start()
@@ -7099,6 +7297,27 @@ class AIAgent:
                     api_kwargs = self._build_api_kwargs(api_messages)
                     if self.api_mode == "codex_responses":
                         api_kwargs = self._preflight_codex_api_kwargs(api_kwargs, allow_stream=False)
+
+                    try:
+                        from hermes_cli.plugins import invoke_hook as _invoke_hook
+                        _invoke_hook(
+                            "pre_api_request",
+                            task_id=effective_task_id,
+                            session_id=self.session_id or "",
+                            platform=self.platform or "",
+                            model=self.model,
+                            provider=self.provider,
+                            base_url=self.base_url,
+                            api_mode=self.api_mode,
+                            api_call_count=api_call_count,
+                            message_count=len(api_messages),
+                            tool_count=len(self.tools or []),
+                            approx_input_tokens=approx_tokens,
+                            request_char_count=total_chars,
+                            max_tokens=self.max_tokens,
+                        )
+                    except Exception:
+                        pass
 
                     if env_var_enabled("HERMES_DUMP_REQUESTS"):
                         self._dump_api_request_debug(api_kwargs, reason="preflight")
@@ -7167,7 +7386,19 @@ class AIAgent:
                         elif not isinstance(output_items, list):
                             response_invalid = True
                             error_details.append("response.output is not a list")
-                        elif len(output_items) == 0:
+                        elif not output_items:
+                            # If we reach here, _run_codex_stream's backfill
+                            # from output_item.done events and text-delta
+                            # synthesis both failed to populate output.
+                            _resp_status = getattr(response, "status", None)
+                            _resp_incomplete = getattr(response, "incomplete_details", None)
+                            logging.warning(
+                                "Codex response.output is empty after stream backfill "
+                                "(status=%s, incomplete_details=%s, model=%s). %s",
+                                _resp_status, _resp_incomplete,
+                                getattr(response, "model", None),
+                                f"api_mode={self.api_mode} provider={self.provider}",
+                            )
                             response_invalid = True
                             error_details.append("response.output is empty")
                     elif self.api_mode == "anthropic_messages":
@@ -7178,11 +7409,11 @@ class AIAgent:
                         elif not isinstance(content_blocks, list):
                             response_invalid = True
                             error_details.append("response.content is not a list")
-                        elif len(content_blocks) == 0:
+                        elif not content_blocks:
                             response_invalid = True
                             error_details.append("response.content is empty")
                     else:
-                        if response is None or not hasattr(response, 'choices') or response.choices is None or len(response.choices) == 0:
+                        if response is None or not hasattr(response, 'choices') or response.choices is None or not response.choices:
                             response_invalid = True
                             if response is None:
                                 error_details.append("response is None")
@@ -7465,6 +7696,17 @@ class AIAgent:
                         self.session_cache_write_tokens += canonical_usage.cache_write_tokens
                         self.session_reasoning_tokens += canonical_usage.reasoning_tokens
 
+                        # Log API call details for debugging/observability
+                        _cache_pct = ""
+                        if canonical_usage.cache_read_tokens and prompt_tokens:
+                            _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
+                        logger.info(
+                            "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
+                            self.session_api_calls, self.model, self.provider or "unknown",
+                            prompt_tokens, completion_tokens, total_tokens,
+                            api_duration, _cache_pct,
+                        )
+
                         cost_result = estimate_usage_cost(
                             self.model,
                             canonical_usage,
@@ -7526,6 +7768,7 @@ class AIAgent:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
                     
                     has_retried_429 = False  # Reset on success
+                    self._touch_activity(f"API call #{api_call_count} completed")
                     break  # Success, exit retry loop
 
                 except InterruptedError:
@@ -7568,9 +7811,11 @@ class AIAgent:
                         # prompt or prefill.  Fall through to normal error path.
 
                     status_code = getattr(api_error, "status_code", None)
+                    error_context = self._extract_api_error_context(api_error)
                     recovered_with_pool, has_retried_429 = self._recover_with_credential_pool(
                         status_code=status_code,
                         has_retried_429=has_retried_429,
+                        error_context=error_context,
                     )
                     if recovered_with_pool:
                         continue
@@ -7668,6 +7913,61 @@ class AIAgent:
                     # A 413 is a payload-size error — the correct response is to
                     # compress history and retry, not abort immediately.
                     status_code = getattr(api_error, "status_code", None)
+
+                    # ── Anthropic Sonnet long-context tier gate ───────────
+                    # Anthropic returns HTTP 429 "Extra usage is required for
+                    # long context requests" when a Claude Max (or similar)
+                    # subscription doesn't include the 1M-context tier.  This
+                    # is NOT a transient rate limit — retrying or switching
+                    # credentials won't help.  Reduce context to 200k (the
+                    # standard tier) and compress.
+                    # Only applies to Sonnet — Opus 1M is general access.
+                    _is_long_context_tier_error = (
+                        status_code == 429
+                        and "extra usage" in error_msg
+                        and "long context" in error_msg
+                        and "sonnet" in self.model.lower()
+                    )
+                    if _is_long_context_tier_error:
+                        _reduced_ctx = 200000
+                        compressor = self.context_compressor
+                        old_ctx = compressor.context_length
+                        if old_ctx > _reduced_ctx:
+                            compressor.context_length = _reduced_ctx
+                            compressor.threshold_tokens = int(
+                                _reduced_ctx * compressor.threshold_percent
+                            )
+                            compressor._context_probed = True
+                            # Don't persist — this is a subscription-tier
+                            # limitation, not a model capability.  If the user
+                            # later enables extra usage the 1M limit should
+                            # come back automatically.
+                            compressor._context_probe_persistable = False
+                            self._vprint(
+                                f"{self.log_prefix}⚠️  Anthropic long-context tier "
+                                f"requires extra usage — reducing context: "
+                                f"{old_ctx:,} → {_reduced_ctx:,} tokens",
+                                force=True,
+                            )
+
+                        compression_attempts += 1
+                        if compression_attempts <= max_compression_attempts:
+                            original_len = len(messages)
+                            messages, active_system_prompt = self._compress_context(
+                                messages, system_message,
+                                approx_tokens=approx_tokens,
+                                task_id=effective_task_id,
+                            )
+                            if len(messages) < original_len or old_ctx > _reduced_ctx:
+                                self._emit_status(
+                                    f"🗜️ Context reduced to {_reduced_ctx:,} tokens "
+                                    f"(was {old_ctx:,}), retrying..."
+                                )
+                                time.sleep(2)
+                                restart_with_compressed_messages = True
+                                break
+                        # Fall through to normal error handling if compression
+                        # is exhausted or didn't help.
 
                     # Eager fallback for rate-limit errors (429 or quota exhaustion).
                     # When a fallback model is configured, switch immediately instead
@@ -7774,7 +8074,33 @@ class AIAgent:
                                 f"treating as probable context overflow.",
                                 force=True,
                             )
-                    
+
+                    # Server disconnects on large sessions are often caused by
+                    # the request exceeding the provider's context/payload limit
+                    # without a proper HTTP error response.  Treat these as
+                    # context-length errors to trigger compression rather than
+                    # burning through retries that will all fail the same way.
+                    # This breaks the death spiral: disconnect → no token data
+                    # → no compression → bigger session → more disconnects.
+                    # (#2153)
+                    if not is_context_length_error and not status_code:
+                        _is_server_disconnect = (
+                            'server disconnected' in error_msg
+                            or 'peer closed connection' in error_msg
+                            or error_type in ('ReadError', 'RemoteProtocolError', 'ServerDisconnectedError')
+                        )
+                        if _is_server_disconnect:
+                            ctx_len = getattr(getattr(self, 'context_compressor', None), 'context_length', 200000)
+                            _is_large = approx_tokens > ctx_len * 0.6 or len(api_messages) > 200
+                            if _is_large:
+                                is_context_length_error = True
+                                self._vprint(
+                                    f"{self.log_prefix}⚠️  Server disconnected with large session "
+                                    f"(~{approx_tokens:,} tokens, {len(api_messages)} msgs) — "
+                                    f"treating as context-length error, attempting compression.",
+                                    force=True,
+                                )
+
                     if is_context_length_error:
                         compressor = self.context_compressor
                         old_ctx = compressor.context_length
@@ -7817,7 +8143,7 @@ class AIAgent:
                                 "error": f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached.",
                                 "partial": True
                             }
-                        self._vprint(f"{self.log_prefix}   🗜️  Context compression attempt {compression_attempts}/{max_compression_attempts}...")
+                        self._emit_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
                         original_len = len(messages)
                         messages, active_system_prompt = self._compress_context(
@@ -7885,16 +8211,26 @@ class AIAgent:
                         self._dump_api_request_debug(
                             api_kwargs, reason="non_retryable_client_error", error=api_error,
                         )
+                        self._emit_status(
+                            f"❌ Non-retryable error (HTTP {status_code}): "
+                            f"{self._summarize_api_error(api_error)}"
+                        )
                         self._vprint(f"{self.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
                         self._vprint(f"{self.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                         self._vprint(f"{self.log_prefix}   🌐 Endpoint: {_base}", force=True)
                         # Actionable guidance for common auth errors
                         if status_code in (401, 403) or "unauthorized" in error_msg or "forbidden" in error_msg or "permission" in error_msg:
-                            self._vprint(f"{self.log_prefix}   💡 Your API key was rejected by the provider. Check:", force=True)
-                            self._vprint(f"{self.log_prefix}      • Is the key valid? Run: hermes setup", force=True)
-                            self._vprint(f"{self.log_prefix}      • Does your account have access to {_model}?", force=True)
-                            if "openrouter" in str(_base).lower():
-                                self._vprint(f"{self.log_prefix}      • Check credits: https://openrouter.ai/settings/credits", force=True)
+                            if _provider == "openai-codex" and status_code == 401:
+                                self._vprint(f"{self.log_prefix}   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been", force=True)
+                                self._vprint(f"{self.log_prefix}      refreshed by another client (Codex CLI, VS Code). To fix:", force=True)
+                                self._vprint(f"{self.log_prefix}      1. Run `codex` in your terminal to generate fresh tokens.", force=True)
+                                self._vprint(f"{self.log_prefix}      2. Then run `hermes auth` to re-authenticate.", force=True)
+                            else:
+                                self._vprint(f"{self.log_prefix}   💡 Your API key was rejected by the provider. Check:", force=True)
+                                self._vprint(f"{self.log_prefix}      • Is the key valid? Run: hermes setup", force=True)
+                                self._vprint(f"{self.log_prefix}      • Does your account have access to {_model}?", force=True)
+                                if "openrouter" in str(_base).lower():
+                                    self._vprint(f"{self.log_prefix}      • Check credits: https://openrouter.ai/settings/credits", force=True)
                         else:
                             self._vprint(f"{self.log_prefix}   💡 This type of error won't be fixed by retrying.", force=True)
                         logging.error(f"{self.log_prefix}Non-retryable client error: {api_error}")
@@ -7938,9 +8274,9 @@ class AIAgent:
                             continue
                         _final_summary = self._summarize_api_error(api_error)
                         if is_rate_limited:
-                            self._vprint(f"{self.log_prefix}❌ Rate limit persisted after {max_retries} retries. Please try again later.", force=True)
+                            self._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
                         else:
-                            self._vprint(f"{self.log_prefix}❌ Max retries ({max_retries}) exceeded. Giving up.", force=True)
+                            self._emit_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
                         self._vprint(f"{self.log_prefix}   💀 Final error: {_final_summary}", force=True)
 
                         # Detect SSE stream-drop pattern (e.g. "Network
@@ -8098,6 +8434,31 @@ class AIAgent:
                     else:
                         assistant_message.content = str(raw)
 
+                try:
+                    from hermes_cli.plugins import invoke_hook as _invoke_hook
+                    _assistant_tool_calls = getattr(assistant_message, "tool_calls", None) or []
+                    _assistant_text = assistant_message.content or ""
+                    _invoke_hook(
+                        "post_api_request",
+                        task_id=effective_task_id,
+                        session_id=self.session_id or "",
+                        platform=self.platform or "",
+                        model=self.model,
+                        provider=self.provider,
+                        base_url=self.base_url,
+                        api_mode=self.api_mode,
+                        api_call_count=api_call_count,
+                        api_duration=api_duration,
+                        finish_reason=finish_reason,
+                        message_count=len(api_messages),
+                        response_model=getattr(response, "model", None),
+                        usage=self._usage_summary_for_api_request_hook(response),
+                        assistant_content_chars=len(_assistant_text),
+                        assistant_tool_call_count=len(_assistant_tool_calls),
+                    )
+                except Exception:
+                    pass
+
                 # Handle assistant response
                 if assistant_message.content and not self.quiet_mode:
                     if self.verbose_logging:
@@ -8107,19 +8468,23 @@ class AIAgent:
 
                 # Notify progress callback of model's thinking (used by subagent
                 # delegation to relay the child's reasoning to the parent display).
-                # Guard: only fire for subagents (_delegate_depth >= 1) to avoid
-                # spamming gateway platforms with the main agent's every thought.
-                if (assistant_message.content and self.tool_progress_callback
-                        and getattr(self, '_delegate_depth', 0) > 0):
+                if (assistant_message.content and self.tool_progress_callback):
                     _think_text = assistant_message.content.strip()
                     # Strip reasoning XML tags that shouldn't leak to parent display
                     _think_text = re.sub(
                         r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
                     ).strip()
+                    # For subagents: relay first line to parent display (existing behaviour).
+                    # For all agents with a structured callback: emit reasoning.available event.
                     first_line = _think_text.split('\n')[0][:80] if _think_text else ""
-                    if first_line:
+                    if first_line and getattr(self, '_delegate_depth', 0) > 0:
                         try:
                             self.tool_progress_callback("_thinking", first_line)
+                        except Exception:
+                            pass
+                    elif _think_text:
+                        try:
+                            self.tool_progress_callback("reasoning.available", "_thinking", _think_text[:500], None)
                         except Exception:
                             pass
                 
@@ -8409,11 +8774,20 @@ class AIAgent:
                     # threshold (default 50%) leaves ample headroom; if tool
                     # results push past it, the next API call will report the
                     # real total and trigger compression then.
+                    #
+                    # If last_prompt_tokens is 0 (stale after API disconnect
+                    # or provider returned no usage data), fall back to rough
+                    # estimate to avoid missing compression.  Without this,
+                    # a session can grow unbounded after disconnects because
+                    # should_compress(0) never fires.  (#2153)
                     _compressor = self.context_compressor
-                    _real_tokens = (
-                        _compressor.last_prompt_tokens
-                        + _compressor.last_completion_tokens
-                    )
+                    if _compressor.last_prompt_tokens > 0:
+                        _real_tokens = (
+                            _compressor.last_prompt_tokens
+                            + _compressor.last_completion_tokens
+                        )
+                    else:
+                        _real_tokens = estimate_messages_tokens_rough(messages)
 
                     # ── Context pressure warnings (user-facing only) ──────────
                     # Notify the user (NOT the LLM) as context approaches the
@@ -8474,140 +8848,24 @@ class AIAgent:
                             self._response_was_previewed = True
                             break
 
-                        # No fallback available — classify the empty response before
-                        # blindly spending retries. Some local/custom backends surface
-                        # implicit context pressure as reasoning-only output rather than
-                        # an explicit overflow error.
-                        if not hasattr(self, '_empty_content_retries'):
-                            self._empty_content_retries = 0
-                        self._empty_content_retries += 1
+                        # Reasoning-only response: the model produced thinking
+                        # but no visible content.  This is a valid response —
+                        # keep reasoning in its own field and set content to
+                        # "(empty)" so every provider accepts the message.
+                        # No retries needed.
+                        reasoning_text = self._extract_reasoning(assistant_message)
+                        assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
+                        assistant_msg["content"] = "(empty)"
+                        messages.append(assistant_msg)
 
-                        empty_response_info = self._classify_empty_content_response(
-                            assistant_message,
-                            finish_reason=finish_reason,
-                            approx_tokens=approx_tokens,
-                            api_messages=api_messages,
-                            conversation_history=conversation_history,
-                        )
-                        reasoning_text = empty_response_info["reasoning_text"]
-                        self._vprint(f"{self.log_prefix}⚠️  Response only contains think block with no content after it")
                         if reasoning_text:
                             reasoning_preview = reasoning_text[:500] + "..." if len(reasoning_text) > 500 else reasoning_text
-                            self._vprint(f"{self.log_prefix}   Reasoning: {reasoning_preview}")
+                            self._vprint(f"{self.log_prefix}ℹ️  Reasoning-only response (no visible content). Reasoning: {reasoning_preview}")
                         else:
-                            content_preview = final_response[:80] + "..." if len(final_response) > 80 else final_response
-                            self._vprint(f"{self.log_prefix}   Content: '{content_preview}'")
+                            self._vprint(f"{self.log_prefix}ℹ️  Empty response (no content or reasoning).")
 
-                        if empty_response_info["should_compress"]:
-                            compression_attempts += 1
-                            if compression_attempts > max_compression_attempts:
-                                self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
-                                self._vprint(f"{self.log_prefix}   💡 Local/custom backend returned reasoning-only output with no visible content. This often means the resumed/large session exceeds the runtime context window. Try /new or lower model.context_length to the actual runtime limit.", force=True)
-                            else:
-                                self._vprint(f"{self.log_prefix}🗜️  Reasoning-only response looks like implicit context pressure — attempting compression ({compression_attempts}/{max_compression_attempts})...", force=True)
-                                original_len = len(messages)
-                                messages, active_system_prompt = self._compress_context(
-                                    messages, system_message, approx_tokens=approx_tokens,
-                                    task_id=effective_task_id,
-                                )
-                                if len(messages) < original_len:
-                                    conversation_history = None
-                                    self._emit_status(f"🗜️ Compressed {original_len} → {len(messages)} messages after reasoning-only response, retrying...")
-                                    time.sleep(2)
-                                    api_call_count -= 1
-                                    self.iteration_budget.refund()
-                                    retry_count += 1
-                                    continue
-                                self._vprint(f"{self.log_prefix}   Compression could not shrink the session; falling back to retry/salvage logic.")
-
-                        if (
-                            reasoning_text
-                            and empty_response_info["repeated_signature"]
-                            and empty_response_info["has_structured_reasoning"]
-                        ):
-                            self._vprint(f"{self.log_prefix}ℹ️  Structured reasoning-only response repeated unchanged — using reasoning text directly.", force=True)
-                            self._empty_content_retries = 0
-                            final_response = reasoning_text
-                            empty_msg = {
-                                "role": "assistant",
-                                "content": final_response,
-                                "reasoning": reasoning_text,
-                                "finish_reason": finish_reason,
-                            }
-                            messages.append(empty_msg)
-                            break
-                        
-                        if self._empty_content_retries < 3:
-                            self._vprint(f"{self.log_prefix}🔄 Retrying API call ({self._empty_content_retries}/3)...")
-                            continue
-                        else:
-                            self._vprint(f"{self.log_prefix}❌ Max retries (3) for empty content exceeded.", force=True)
-                            self._empty_content_retries = 0
-                            
-                            # If a prior tool_calls turn had real content, salvage it:
-                            # rewrite that turn's content to a brief tool description,
-                            # and use the original content as the final response here.
-                            fallback = getattr(self, '_last_content_with_tools', None)
-                            if fallback:
-                                self._last_content_with_tools = None
-                                # Find the last assistant message with tool_calls and rewrite it
-                                for i in range(len(messages) - 1, -1, -1):
-                                    msg = messages[i]
-                                    if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                                        tool_names = []
-                                        for tc in msg["tool_calls"]:
-                                            if not tc or not isinstance(tc, dict): continue
-                                            fn = tc.get("function", {})
-                                            tool_names.append(fn.get("name", "unknown"))
-                                        msg["content"] = f"Calling the {', '.join(tool_names)} tool{'s' if len(tool_names) > 1 else ''}..."
-                                        break
-                                # Strip <think> blocks from fallback content for user display
-                                final_response = self._strip_think_blocks(fallback).strip()
-                                self._response_was_previewed = True
-                                break
-                            
-                            # No fallback -- if reasoning_text exists, the model put its
-                            # entire response inside <think> tags; use that as the content.
-                            if reasoning_text:
-                                self._vprint(f"{self.log_prefix}Using reasoning as response content (model wrapped entire response in think tags).", force=True)
-                                final_response = reasoning_text
-                                empty_msg = {
-                                    "role": "assistant",
-                                    "content": final_response,
-                                    "reasoning": reasoning_text,
-                                    "finish_reason": finish_reason,
-                                }
-                                messages.append(empty_msg)
-                                break
-
-                            # Truly empty -- no reasoning and no content
-                            empty_msg = {
-                                "role": "assistant",
-                                "content": final_response,
-                                "reasoning": reasoning_text,
-                                "finish_reason": finish_reason,
-                            }
-                            messages.append(empty_msg)
-
-                            self._cleanup_task_resources(effective_task_id)
-                            self._persist_session(messages, conversation_history)
-
-                            error_message = "Model generated only think blocks with no actual response after 3 retries"
-                            if empty_response_info["is_local_custom"]:
-                                error_message = (
-                                    "Local/custom backend returned reasoning-only output with no visible response after 3 retries. "
-                                    "Likely causes: wrong /v1 endpoint, runtime context window smaller than Hermes expects, "
-                                    "or a resumed/large session exceeding the backend's actual context limit."
-                                )
-
-                            return {
-                                "final_response": final_response or None,
-                                "messages": messages,
-                                "api_calls": api_call_count,
-                                "completed": False,
-                                "partial": True,
-                                "error": error_message
-                            }
+                        final_response = "(empty)"
+                        break
                     
                     # Reset retry counter/signature on successful content
                     if hasattr(self, '_empty_content_retries'):
@@ -8693,7 +8951,6 @@ class AIAgent:
                                     "content": f"Error executing tool: {error_msg}",
                                 }
                                 messages.append(err_msg)
-                        pending_handled = True
                     break
                 
                 # Non-tool errors don't need a synthetic message injected.
@@ -8730,10 +8987,6 @@ class AIAgent:
         # Persist session to both JSON log and SQLite
         self._persist_session(messages, conversation_history)
 
-        # Sync conversation to Honcho for user modeling
-        if final_response and not interrupted and sync_honcho:
-            self._honcho_sync(original_user_message, final_response)
-            self._queue_honcho_prefetch(original_user_message)
 
         # Plugin hook: post_llm_call
         # Fired once per turn after the tool-calling loop completes.
@@ -8807,6 +9060,16 @@ class AIAgent:
             _should_review_skills = True
             self._iters_since_skill = 0
 
+        # External memory provider: sync the completed turn + queue next prefetch.
+        # Use original_user_message (clean input) — user_message may contain
+        # injected skill content that bloats / breaks provider queries.
+        if self._memory_manager and final_response and original_user_message:
+            try:
+                self._memory_manager.sync_all(original_user_message, final_response)
+                self._memory_manager.queue_prefetch_all(original_user_message)
+            except Exception:
+                pass
+
         # Background memory/skill review — runs AFTER the response is delivered
         # so it never competes with the user's task for model attention.
         if final_response and not interrupted and (_should_review_memory or _should_review_skills):
@@ -8818,6 +9081,13 @@ class AIAgent:
                 )
             except Exception:
                 pass  # Background review is best-effort
+
+        # Note: Memory provider on_session_end() + shutdown_all() are NOT
+        # called here — run_conversation() is called once per user message in
+        # multi-turn sessions. Shutting down after every turn would kill the
+        # provider before the second message. Actual session-end cleanup is
+        # handled by the CLI (atexit / /reset) and gateway (session expiry /
+        # _reset_session).
 
         # Plugin hook: on_session_end
         # Fired at the very end of every run_conversation call.
