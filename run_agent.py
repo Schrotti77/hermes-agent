@@ -5467,6 +5467,40 @@ class AIAgent:
 
         return api_kwargs
 
+    def _provider_needs_reasoning_content(self) -> bool:
+        """Return True when the provider benefits from reasoning_content in history.
+
+        Some providers (OpenRouter, Nous Portal) use reasoning_content and
+        reasoning_details for multi-turn reasoning continuity — the model
+        picks up where it left off thinking.  Sending these tokens back is
+        essential for coherent multi-step reasoning on those providers.
+
+        Other providers (Z.AI/GLM, local models, most direct APIs) either
+        ignore reasoning_content entirely or, worse, count it against the
+        context window without using it.  Stripping it saves thousands of
+        tokens per turn — critical for models like GLM-5-Turbo that
+        generate large thinking blocks by default.
+
+        Note: This is about history replay, not about enabling/disabling
+        reasoning (that's _supports_reasoning_extra_body).
+        """
+        # OpenRouter proxies to many reasoning-capable backends and uses
+        # reasoning_content / reasoning_details for multi-turn continuity.
+        if self._is_openrouter_url():
+            return True
+        # Nous Portal — reasoning is core to their offering.
+        if "nousresearch" in self._base_url_lower:
+            return True
+        # GitHub Models / GitHub Copilot — uses encrypted reasoning items.
+        if "models.github.ai" in self._base_url_lower or "api.githubcopilot.com" in self._base_url_lower:
+            return True
+        # Mistral API — supports reasoning natively.
+        if "api.mistral.ai" in self._base_url_lower:
+            return True
+        # All other providers (Z.AI, local models, etc.): strip reasoning
+        # from history to save context tokens.
+        return False
+
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
 
@@ -5983,6 +6017,27 @@ class AIAgent:
                 store=self._todo_store,
             )
         elif function_name == "session_search":
+            # In honcho mode, route session_search to honcho_search instead of SQLite
+            _hcfg_ss = getattr(self, '_honcho_config', None)
+            _honcho_mgr_ss = getattr(self, '_honcho', None)
+            if _hcfg_ss and _hcfg_ss.memory_mode == "honcho" and _honcho_mgr_ss:
+                try:
+                    _result = _honcho_mgr_ss.search_context(
+                        query=function_args.get("query", ""),
+                        max_tokens=1500,
+                    )
+                    return json.dumps({
+                        "success": True,
+                        "source": "honcho",
+                        "results": _result,
+                    }) if _result else json.dumps({
+                        "success": False,
+                        "source": "honcho",
+                        "error": "No results from Honcho search.",
+                    })
+                except Exception as _e:
+                    logger.warning("honcho_search failed, falling back to SQLite: %s", _e)
+            # Fallback: use SQLite session_search
             if not self._session_db:
                 return json.dumps({"success": False, "error": "Session database not available."})
             from tools.session_search_tool import session_search as _session_search
@@ -6355,7 +6410,38 @@ class AIAgent:
                 if self.quiet_mode:
                     self._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
             elif function_name == "session_search":
-                if not self._session_db:
+                # In honcho mode, route to honcho_search instead of SQLite
+                _hcfg_ss2 = getattr(self, '_honcho_config', None)
+                _honcho_mgr_ss2 = getattr(self, '_honcho', None)
+                if _hcfg_ss2 and _hcfg_ss2.memory_mode == "honcho" and _honcho_mgr_ss2:
+                    try:
+                        _result2 = _honcho_mgr_ss2.search_context(
+                            query=function_args.get("query", ""),
+                            max_tokens=1500,
+                        )
+                        function_result = json.dumps({
+                            "success": True,
+                            "source": "honcho",
+                            "results": _result2,
+                        }) if _result2 else json.dumps({
+                            "success": False,
+                            "source": "honcho",
+                            "error": "No results from Honcho search.",
+                        })
+                    except Exception as _e2:
+                        logger.warning("honcho_search failed, falling back to SQLite: %s", _e2)
+                        if not self._session_db:
+                            function_result = json.dumps({"success": False, "error": "Session database not available."})
+                        else:
+                            from tools.session_search_tool import session_search as _session_search
+                            function_result = _session_search(
+                                query=function_args.get("query", ""),
+                                role_filter=function_args.get("role_filter"),
+                                limit=function_args.get("limit", 3),
+                                db=self._session_db,
+                                current_session_id=self.session_id,
+                            )
+                elif not self._session_db:
                     function_result = json.dumps({"success": False, "error": "Session database not available."})
                 else:
                     from tools.session_search_tool import session_search as _session_search
@@ -7188,9 +7274,15 @@ class AIAgent:
 
                 # For ALL assistant messages, pass reasoning back to the API
                 # This ensures multi-turn reasoning context is preserved
+                # — BUT only for providers that actually use it.
+                # Reasoning tokens are expensive and can consume the entire
+                # output budget on providers like Z.AI (GLM-5-Turbo) that
+                # generate thinking blocks by default.  Stripping them from
+                # the history saves thousands of context tokens per turn.
+                _passes_reasoning_content = self._provider_needs_reasoning_content()
                 if msg.get("role") == "assistant":
                     reasoning_text = msg.get("reasoning")
-                    if reasoning_text:
+                    if reasoning_text and _passes_reasoning_content:
                         # Add reasoning_content for API compatibility (Moonshot AI, Novita, OpenRouter)
                         api_msg["reasoning_content"] = reasoning_text
 
@@ -7209,6 +7301,10 @@ class AIAgent:
                     self._sanitize_tool_calls_for_strict_api(api_msg)
                 # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
                 # The signature field helps maintain reasoning continuity
+                if not _passes_reasoning_content:
+                    # Also strip reasoning_details for providers that don't need
+                    # reasoning continuity — these opaque blobs can be large.
+                    api_msg.pop("reasoning_details", None)
                 api_messages.append(api_msg)
 
             # Build the final system message: cached prompt + ephemeral system prompt.
@@ -9249,11 +9345,18 @@ def main(
     disabled_toolsets_list = None
     
     if enabled_toolsets:
-        enabled_toolsets_list = [t.strip() for t in enabled_toolsets.split(",")]
+        # Fire may pass comma-separated string as tuple
+        if isinstance(enabled_toolsets, (tuple, list)):
+            enabled_toolsets_list = [str(t).strip() for t in enabled_toolsets]
+        else:
+            enabled_toolsets_list = [t.strip() for t in enabled_toolsets.split(",")]
         print(f"🎯 Enabled toolsets: {enabled_toolsets_list}")
     
     if disabled_toolsets:
-        disabled_toolsets_list = [t.strip() for t in disabled_toolsets.split(",")]
+        if isinstance(disabled_toolsets, (tuple, list)):
+            disabled_toolsets_list = [str(t).strip() for t in disabled_toolsets]
+        else:
+            disabled_toolsets_list = [t.strip() for t in disabled_toolsets.split(",")]
         print(f"🚫 Disabled toolsets: {disabled_toolsets_list}")
     
     if save_trajectories:

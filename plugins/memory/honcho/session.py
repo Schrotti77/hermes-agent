@@ -6,6 +6,7 @@ import queue
 import re
 import logging
 import threading
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, TYPE_CHECKING
@@ -573,7 +574,7 @@ class HonchoSessionManager:
                 result = result[:self._dialectic_max_chars].rsplit(" ", 1)[0] + " …"
             return result
         except Exception as e:
-            logger.warning("Honcho dialectic query failed: %s", e)
+            logger.warning("Honcho dialectic query failed: %s\n%s", e, traceback.format_exc())
             return ""
 
     def prefetch_dialectic(self, session_key: str, query: str) -> None:
@@ -670,7 +671,7 @@ class HonchoSessionManager:
             result["representation"] = user_ctx["representation"]
             result["card"] = "\n".join(user_ctx["card"])
         except Exception as e:
-            logger.warning("Failed to fetch user context from Honcho: %s", e)
+            logger.warning("Failed to fetch user context from Honcho: %s\n%s", e, traceback.format_exc())
 
         # Also fetch AI peer's own representation so Hermes knows itself.
         try:
