@@ -9569,11 +9569,11 @@ def main(
     disabled_toolsets_list = None
     
     if enabled_toolsets:
-        enabled_toolsets_list = [t.strip() for t in enabled_toolsets.split(",")]
+        enabled_toolsets_list = enabled_toolsets if isinstance(enabled_toolsets, (list, str)) else [t.strip() for t in enabled_toolsets.split(",")]
         print(f"🎯 Enabled toolsets: {enabled_toolsets_list}")
-    
+
     if disabled_toolsets:
-        disabled_toolsets_list = [t.strip() for t in disabled_toolsets.split(",")]
+        disabled_toolsets_list = disabled_toolsets if isinstance(disabled_toolsets, (list, str)) else [t.strip() for t in disabled_toolsets.split(",")]
         print(f"🚫 Disabled toolsets: {disabled_toolsets_list}")
     
     if save_trajectories:
