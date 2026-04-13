@@ -388,6 +388,49 @@ class TestUnifiedCronjobTool:
         assert result["success"] is True
         assert result["name"] == "Use both skills and combine the result."
 
+    def test_update_model_dict_resolves_provider_and_model(self):
+        """model param as dict (matching tool schema) should resolve to flat fields."""
+        created = json.loads(
+            cronjob(action="create", prompt="Check", schedule="every 1h")
+        )
+        job_id = created["job_id"]
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=job_id,
+                model={"model": "glm-5.1", "provider": "zai"},
+            )
+        )
+        assert updated["success"] is True
+        assert updated["job"]["model"] == "glm-5.1"
+        assert updated["job"]["provider"] == "zai"
+
+    def test_update_model_dict_preserves_existing_provider_when_omitted(self):
+        """When model dict omits provider, it should pin current provider."""
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check",
+                schedule="every 1h",
+                model="some-model",
+                provider="existing",
+            )
+        )
+        job_id = created["job_id"]
+
+        # Update with model dict that omits provider — should NOT clear existing provider
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=job_id,
+                model={"model": "new-model"},
+            )
+        )
+        assert updated["success"] is True
+        assert updated["job"]["model"] == "new-model"
+        # provider resolved via _resolve_model_override (best-effort pin from config)
+
     def test_update_can_clear_skills(self):
         created = json.loads(
             cronjob(

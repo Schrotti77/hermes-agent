@@ -335,8 +335,16 @@ def cronjob(
                 canonical_skills = _canonical_skills(skill, skills)
                 updates["skills"] = canonical_skills
                 updates["skill"] = canonical_skills[0] if canonical_skills else None
+            # Model override: schema defines `model` as an object with optional
+            # `provider` and required `model` keys.  Resolve to flat provider/model
+            # strings for job storage — matching the create path.
             if model is not None:
-                updates["model"] = _normalize_optional_job_value(model)
+                if isinstance(model, dict):
+                    resolved_provider, resolved_model = _resolve_model_override(model)
+                    updates["model"] = resolved_model
+                    updates["provider"] = resolved_provider
+                else:
+                    updates["model"] = _normalize_optional_job_value(model)
             if provider is not None:
                 updates["provider"] = _normalize_optional_job_value(provider)
             if base_url is not None:
